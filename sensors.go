@@ -20,10 +20,20 @@ import (
 	"runtime"
 	"crypto/sha256"
 
+	"path/filepath"
+	"bufio"
+
 	"github.com/shirou/gopsutil/v3/process"
 	"github.com/shuffle/shuffle-shared"
 )
 
+type MacApp struct {
+	Name          string `json:"_name"`
+	Version       string `json:"version"`
+	BundleVersion string `json:"bundle_version"`
+	Path          string `json:"path"`
+	Info string `json:"info"`
+}
 
 // Scanner manages concurrent directory scanning
 type Scanner struct {
@@ -655,4 +665,540 @@ func indexByte(s string, c byte) int {
 		}
 	}
 	return -1
+}
+
+// NewScanner creates a new project scanner
+func NewScanner() *Scanner {
+	return &Scanner{
+		results: make(chan shuffle.ProjectInfo),
+		visited: make(map[string]bool),
+	}
+}
+
+// extractGoPackages parses go.mod file and extracts packages with versions
+func extractGoPackages(dir string) []shuffle.Software {
+	goModPath := filepath.Join(dir, "go.mod")
+	file, err := os.Open(goModPath)
+	if err != nil {
+		return []shuffle.Software{}
+	}
+	defer file.Close()
+
+	var packages []shuffle.Software
+	scanner := bufio.NewScanner(file)
+	inRequire := false
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if line == "require (" {
+			inRequire = true
+			continue
+		}
+		if line == ")" && inRequire {
+			inRequire = false
+			continue
+		}
+
+		if inRequire && line != "" && !strings.HasPrefix(line, "//") {
+			// Parse: package-name version
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				packages = append(packages, shuffle.Software{
+					Name:    parts[0],
+					Version: parts[1],
+				})
+			} else if len(parts) == 1 {
+				packages = append(packages, shuffle.Software{
+					Name:    parts[0],
+					Version: "",
+				})
+			}
+		}
+	}
+
+	return packages
+}
+
+// extractPythonPackages parses Python dependency files
+func extractPythonPackages(dir string) []shuffle.Software {
+	var packages []shuffle.Software
+
+	// Try pyproject.toml first
+	if data, err := os.ReadFile(filepath.Join(dir, "pyproject.toml")); err == nil {
+		packages = parsePyprojectToml(string(data))
+		if len(packages) > 0 {
+			return packages
+		}
+	}
+
+	// Fall back to requirements.txt
+	if data, err := os.ReadFile(filepath.Join(dir, "requirements.txt")); err == nil {
+		packages = parseRequirementsTxt(string(data))
+		if len(packages) > 0 {
+			return packages
+		}
+	}
+
+	// Try Pipfile
+	if data, err := os.ReadFile(filepath.Join(dir, "Pipfile")); err == nil {
+		packages = parsePipfile(string(data))
+	}
+
+	return packages
+}
+
+// parseRequirementsTxt extracts package names and versions from requirements.txt
+func parseRequirementsTxt(content string) []shuffle.Software {
+	var packages []shuffle.Software
+	scanner := bufio.NewScanner(strings.NewReader(content))
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse: package>=1.0.0 or package==1.0.0, etc.
+		var name, version string
+
+		// Find first version specifier
+		versionOps := []string{">=", "<=", "==", "~=", "!=", ">", "<", ";"}
+		minIdx := len(line)
+		for _, op := range versionOps {
+			if idx := strings.Index(line, op); idx >= 0 && idx < minIdx {
+				minIdx = idx
+			}
+		}
+
+		if minIdx < len(line) {
+			name = strings.TrimSpace(line[:minIdx])
+			version = strings.TrimSpace(line[minIdx:])
+		} else {
+			name = line
+			version = ""
+		}
+
+		if name != "" {
+			packages = append(packages, shuffle.Software{
+				Name:    name,
+				Version: version,
+			})
+		}
+	}
+
+	return packages
+}
+
+// parsePyprojectToml extracts dependencies from pyproject.toml
+func parsePyprojectToml(content string) []shuffle.Software {
+	var packages []shuffle.Software
+	inDeps := false
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if strings.Contains(line, "dependencies") || strings.Contains(line, "requires") {
+			inDeps = true
+			continue
+		}
+
+		if inDeps && strings.HasPrefix(line, "[") {
+			inDeps = false
+		}
+
+		if inDeps && strings.HasPrefix(line, "\"") {
+			// Extract package name from dependency string like: "django>=3.0,<4.0"
+			pkg := strings.Trim(line, "\",")
+
+			// Find first version specifier
+			versionOps := []string{">=", "<=", "==", "~=", "!=", ">", "<", ";"}
+			minIdx := len(pkg)
+			for _, op := range versionOps {
+				if idx := strings.Index(pkg, op); idx >= 0 && idx < minIdx {
+					minIdx = idx
+				}
+			}
+
+			var name, version string
+			if minIdx < len(pkg) {
+				name = strings.TrimSpace(pkg[:minIdx])
+				version = strings.TrimSpace(pkg[minIdx:])
+			} else {
+				name = pkg
+				version = ""
+			}
+
+			if name != "" {
+				packages = append(packages, shuffle.Software{
+					Name:    name,
+					Version: version,
+				})
+			}
+		}
+	}
+
+	return packages
+}
+
+// parsePipfile extracts dependencies from Pipfile
+func parsePipfile(content string) []shuffle.Software {
+	var packages []shuffle.Software
+	inPackages := false
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if strings.Contains(line, "[packages]") {
+			inPackages = true
+			continue
+		}
+
+		if inPackages && strings.HasPrefix(line, "[") {
+			inPackages = false
+		}
+
+		if inPackages && line != "" && !strings.HasPrefix(line, "[") {
+			// Parse: package = "==1.0" or package = "*"
+			parts := strings.Split(line, "=")
+			if len(parts) >= 2 {
+				name := strings.TrimSpace(parts[0])
+				version := strings.TrimSpace(strings.Join(parts[1:], "="))
+				version = strings.Trim(version, "\"'")
+				packages = append(packages, shuffle.Software{
+					Name:    name,
+					Version: version,
+				})
+			}
+		}
+	}
+
+	return packages
+}
+
+// extractJavaScriptPackages parses package.json and extracts packages with versions
+func extractJavaScriptPackages(dir string) []shuffle.Software {
+	packageJsonPath := filepath.Join(dir, "package.json")
+	data, err := os.ReadFile(packageJsonPath)
+	if err != nil {
+		return []shuffle.Software{}
+	}
+
+	var pkgData map[string]interface{}
+	if err := json.Unmarshal(data, &pkgData); err != nil {
+		return []shuffle.Software{}
+	}
+
+	var packages []shuffle.Software
+
+	// Extract dependencies
+	if deps, ok := pkgData["dependencies"].(map[string]interface{}); ok {
+		for pkg, ver := range deps {
+			version := ""
+			if v, ok := ver.(string); ok {
+				version = v
+			}
+			packages = append(packages, shuffle.Software{
+				Name:    pkg,
+				Version: version,
+			})
+		}
+	}
+
+	// Extract devDependencies
+	if devDeps, ok := pkgData["devDependencies"].(map[string]interface{}); ok {
+		for pkg, ver := range devDeps {
+			version := ""
+			if v, ok := ver.(string); ok {
+				version = v
+			}
+			packages = append(packages, shuffle.Software{
+				Name:    pkg,
+				Version: version,
+			})
+		}
+	}
+
+	return packages
+}
+
+// extractJavaPackages parses Maven pom.xml or Gradle build files
+func extractJavaPackages(dir string) []shuffle.Software {
+	// Try Maven first
+	pomPath := filepath.Join(dir, "pom.xml")
+	if data, err := os.ReadFile(pomPath); err == nil {
+		return parsePomXml(string(data))
+	}
+
+	// Try Gradle
+	gradlePath := filepath.Join(dir, "build.gradle")
+	if data, err := os.ReadFile(gradlePath); err == nil {
+		return parseGradleBuild(string(data))
+	}
+
+	// Try Gradle Kotlin DSL
+	gradleKtsPath := filepath.Join(dir, "build.gradle.kts")
+	if data, err := os.ReadFile(gradleKtsPath); err == nil {
+		return parseGradleBuild(string(data))
+	}
+
+	return []shuffle.Software{}
+}
+
+// parsePomXml extracts dependencies from Maven pom.xml
+func parsePomXml(content string) []shuffle.Software {
+	var packages []shuffle.Software
+	inDeps := false
+	var currentGroupId string
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if strings.Contains(line, "<dependencies>") {
+			inDeps = true
+			continue
+		}
+		if strings.Contains(line, "</dependencies>") {
+			inDeps = false
+			continue
+		}
+
+		if inDeps {
+			if strings.Contains(line, "<groupId>") {
+				currentGroupId = extractXmlValue(line, "groupId")
+			}
+			if strings.Contains(line, "<version>") && currentGroupId != "" {
+				version := extractXmlValue(line, "version")
+				packages = append(packages, shuffle.Software{
+					Name:    currentGroupId,
+					Version: version,
+				})
+				currentGroupId = ""
+			}
+		}
+	}
+
+	return packages
+}
+
+// parseGradleBuild extracts dependencies from Gradle build files
+func parseGradleBuild(content string) []shuffle.Software {
+	var packages []shuffle.Software
+	inDeps := false
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if strings.Contains(line, "dependencies") || strings.Contains(line, "dependencies {") {
+			inDeps = true
+			continue
+		}
+
+		if inDeps && strings.HasPrefix(line, "}") {
+			inDeps = false
+			continue
+		}
+
+		if inDeps && (strings.HasPrefix(line, "implementation") ||
+			strings.HasPrefix(line, "compile") ||
+			strings.HasPrefix(line, "testImplementation")) {
+
+			// Extract dependency string: implementation 'group:artifact:version'
+			start := strings.Index(line, "'")
+			end := strings.LastIndex(line, "'")
+			if start >= 0 && end > start {
+				dep := line[start+1 : end]
+				parts := strings.Split(dep, ":")
+				if len(parts) >= 3 {
+					packages = append(packages, shuffle.Software{
+						Name:    parts[0] + ":" + parts[1],
+						Version: parts[2],
+					})
+				} else if len(parts) >= 2 {
+					packages = append(packages, shuffle.Software{
+						Name:    parts[0],
+						Version: parts[1],
+					})
+				}
+			}
+		}
+	}
+
+	return packages
+}
+
+// extractRubyPackages parses Gemfile for Ruby dependencies
+func extractRubyPackages(dir string) []shuffle.Software {
+	gemfilePath := filepath.Join(dir, "Gemfile")
+	data, err := os.ReadFile(gemfilePath)
+	if err != nil {
+		return []shuffle.Software{}
+	}
+
+	return parseGemfile(string(data))
+}
+
+// parseGemfile extracts gem names and versions from Gemfile
+func parseGemfile(content string) []shuffle.Software {
+	var packages []shuffle.Software
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip comments and blank lines
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Match: gem 'gem-name' or gem "gem-name" or gem 'gem-name', '~> 1.0'
+		if strings.HasPrefix(line, "gem") {
+			// Extract gem name and version
+			var name, version string
+
+			if strings.Contains(line, "'") {
+				start := strings.Index(line, "'") + 1
+				end := strings.Index(line[start:], "'")
+				if end > 0 {
+					name = line[start : start+end]
+					// Look for version specification after the name
+					rest := line[start+end+1:]
+					if strings.Contains(rest, "'") || strings.Contains(rest, "\"") {
+						// Extract version from second quoted string
+						var versionStart, versionEnd int
+						if strings.Contains(rest, "'") {
+							versionStart = strings.Index(rest, "'") + 1
+							versionEnd = strings.Index(rest[versionStart:], "'")
+						} else if strings.Contains(rest, "\"") {
+							versionStart = strings.Index(rest, "\"") + 1
+							versionEnd = strings.Index(rest[versionStart:], "\"")
+						}
+						if versionEnd > 0 {
+							version = rest[versionStart : versionStart+versionEnd]
+						}
+					}
+				}
+			} else if strings.Contains(line, "\"") {
+				start := strings.Index(line, "\"") + 1
+				end := strings.Index(line[start:], "\"")
+				if end > 0 {
+					name = line[start : start+end]
+					// Look for version specification after the name
+					rest := line[start+end+1:]
+					if strings.Contains(rest, "'") || strings.Contains(rest, "\"") {
+						var versionStart, versionEnd int
+						if strings.Contains(rest, "'") {
+							versionStart = strings.Index(rest, "'") + 1
+							versionEnd = strings.Index(rest[versionStart:], "'")
+						} else if strings.Contains(rest, "\"") {
+							versionStart = strings.Index(rest, "\"") + 1
+							versionEnd = strings.Index(rest[versionStart:], "\"")
+						}
+						if versionEnd > 0 {
+							version = rest[versionStart : versionStart+versionEnd]
+						}
+					}
+				}
+			}
+
+			if name != "" {
+				packages = append(packages, shuffle.Software{
+					Name:    name,
+					Version: version,
+				})
+			}
+		}
+	}
+
+	return packages
+}
+
+// extractDotnetPackages parses .NET project files for dependencies
+func extractDotnetPackages(dir string) []shuffle.Software {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return []shuffle.Software{}
+	}
+
+	// Find the first .csproj, .vbproj, or .fsproj file
+	var projFile string
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasSuffix(name, ".csproj") ||
+			strings.HasSuffix(name, ".vbproj") ||
+			strings.HasSuffix(name, ".fsproj") {
+			projFile = filepath.Join(dir, name)
+			break
+		}
+	}
+
+	if projFile == "" {
+		return []shuffle.Software{}
+	}
+
+	data, err := os.ReadFile(projFile)
+	if err != nil {
+		return []shuffle.Software{}
+	}
+
+	return parseDotnetProjectFile(string(data))
+}
+
+// parseDotnetProjectFile extracts NuGet package references from .csproj/.vbproj/.fsproj
+func parseDotnetProjectFile(content string) []shuffle.Software {
+	var packages []shuffle.Software
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Look for <PackageReference Include="PackageName" Version="..." />
+		if strings.Contains(line, "PackageReference") && strings.Contains(line, "Include") {
+			// Extract Include attribute value (package name)
+			var pkgName string
+			start := strings.Index(line, "Include=\"") + len("Include=\"")
+			end := strings.Index(line[start:], "\"")
+			if end > 0 {
+				pkgName = line[start : start+end]
+			}
+
+			// Extract Version attribute value
+			var version string
+			if versionIdx := strings.Index(line, "Version=\""); versionIdx >= 0 {
+				start := versionIdx + len("Version=\"")
+				end := strings.Index(line[start:], "\"")
+				if end > 0 {
+					version = line[start : start+end]
+				}
+			}
+
+			if pkgName != "" {
+				packages = append(packages, shuffle.Software{
+					Name:    pkgName,
+					Version: version,
+				})
+			}
+		}
+	}
+
+	return packages
+}
+
+// extractXmlValue is a helper to extract simple XML tag values
+func extractXmlValue(line string, tag string) string {
+	openTag := "<" + tag + ">"
+	closeTag := "</" + tag + ">"
+
+	start := strings.Index(line, openTag)
+	end := strings.Index(line, closeTag)
+
+	if start >= 0 && end > start {
+		return line[start+len(openTag) : end]
+	}
+
+	return ""
 }
