@@ -77,33 +77,6 @@ func RunCommandString(command string, timeout time.Duration, onStream StreamFn) 
 	}	
 }
 
-
-// captureDisplay captures a single display by 1-based index.
-func captureDisplay(display int) ([]byte, error) {
-	path := filepath.Join(
-		os.TempDir(),
-		fmt.Sprintf("edr-%d-d%d.png", time.Now().UnixNano(), display),
-	)
-	defer os.Remove(path)
-
-	// Flags:
-	//   -x      silent (no shutter sound)
-	//   -t png  output format
-	//   -D n    display index (1 = primary)
-	cmd := exec.Command("screencapture", "-x", "-t", "png", "-D", fmt.Sprintf("%d", display), path)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, errors.New(fmt.Sprintf("screencapture display %d: %w — %s", display, err, out))
-	}
-
-	// An out-of-range display index causes screencapture to exit 0 but write
-	// nothing. Treat a missing output file as end-of-displays.
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, errors.New(fmt.Sprintf("display %d produced no output", display))
-	}
-	return data, nil
-}
-
 func IsElevated() bool {
 	return os.Geteuid() == 0
 }

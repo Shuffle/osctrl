@@ -71,6 +71,7 @@ import (
 	"errors"
 	"log"
 	"encoding/json"
+	"path/filepath"
 
 	"os/exec"
 	"runtime"
@@ -106,61 +107,6 @@ func remoteControlBatch(batch shuffle.RemoteControlActionBatch) error {
 	}
 
 	return nil
-}
-
-func remoteControlExecute(a shuffle.RemoteControl) {
-	switch a.Op {
-
-	// -------- Mouse --------
-
-	case "mouse.move":
-		x := getInt(a.Params, "x")
-		y := getInt(a.Params, "y")
-		setCursor(x, y)
-
-	case "mouse.click":
-		x := getInt(a.Params, "x")
-		y := getInt(a.Params, "y")
-		button := getString(a.Params, "button")
-		delay := getInt(a.Params, "delay_ms")
-
-		setCursor(x, y)
-		time.Sleep(time.Duration(delay) * time.Millisecond)
-
-		mouseDown(button)
-		time.Sleep(50 * time.Millisecond)
-		mouseUp(button)
-
-	case "mouse.drag":
-		fx := getInt(a.Params, "from_x")
-		fy := getInt(a.Params, "from_y")
-		tx := getInt(a.Params, "to_x")
-		ty := getInt(a.Params, "to_y")
-		button := getString(a.Params, "button")
-
-		setCursor(fx, fy)
-		time.Sleep(50 * time.Millisecond)
-
-		mouseDown(button)
-		time.Sleep(50 * time.Millisecond)
-
-		setCursor(tx, ty)
-		time.Sleep(50 * time.Millisecond)
-
-		mouseUp(button)
-
-	// -------- Keyboard --------
-
-	case "keyboard.press":
-		key := getInt(a.Params, "key")
-		keyPress(uint16(key))
-
-	// -------- Utility --------
-
-	case "system.wait":
-		ms := getInt(a.Params, "ms")
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-	}
 }
 
 const (
@@ -355,25 +301,8 @@ var vkToMacKeyCode = map[uint16]C.CGKeyCode{
 	40: 125, // Down Arrow
 }
 
-func keyPress(vk uint16) {
-	macCode, ok := vkToMacKeyCode[vk]
-	if !ok {
-		// Fallback: If code is not in the map, pass directly
-		macCode = C.CGKeyCode(vk)
-	}
-
-	C.NativeKeyEvent(macCode, true)
-	time.Sleep(30 * time.Millisecond)
-	C.NativeKeyEvent(macCode, false)
-}
-
-
 func Screenshot() ([]shuffle.ScreenshotWrapper, error) {
-	if runtime.GOOS == "darwin" {
-		return ScreenshotMacos()
-	} else {
-		return nil, errors.New(fmt.Sprintf(fmt.Sprintf("screenshot not supported on %s platform", runtime.GOOS)))
-	}
+	return ScreenshotMacos()
 }
 
 func ScreenshotMacos() ([]shuffle.ScreenshotWrapper, error) {
@@ -451,6 +380,35 @@ func GetFrontmostPIDShell() (int, error) {
 	return strconv.Atoi(pidStr)
 }
 
+// captureDisplay captures a single display by 1-based index.
+func captureDisplay(display int) ([]byte, error) {
+	path := filepath.Join(
+		os.TempDir(),
+		fmt.Sprintf("edr-%d-d%d.png", time.Now().UnixNano(), display),
+	)
+
+	defer os.Remove(path)
+
+	// Flags:
+	//   -x      silent (no shutter sound)
+	//   -t png  output format
+	//   -D n    display index (1 = primary)
+	cmd := exec.Command("screencapture", "-x", "-t", "jpg", "-D", fmt.Sprintf("%d", display), path)
+	//cmd := exec.Command("screencapture", "-x", "-t", "png", "-D", fmt.Sprintf("%d", display), fmt.Sprintf("fullsize-%s", path), "&&", "sips", "-resampleHeightWidthMax", "1280", fmt.Sprintf("fullsize-%s", path), "--out", path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, errors.New(fmt.Sprintf("screencapture display %d: %w — %s", display, err, out))
+	}
+
+	// An out-of-range display index causes screencapture to exit 0 but write
+	// nothing. Treat a missing output file as end-of-displays.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, errors.New(fmt.Sprintf("display %d produced no output", display))
+	}
+
+	return data, nil
+}
+
 // ScreenshotAllDisplays captures every active display and returns one PNG
 // per display. Display indices are 1-based in screencapture; we probe until
 // the tool produces no output, which is how it signals an out-of-range index.
@@ -483,7 +441,7 @@ func ScreenshotAllDisplaysMacos() ([]shuffle.ScreenshotWrapper, error) {
 	*/
 
 	for display := 1; ; display++ {
-		png, err := captureDisplay(display)
+		img, err := captureDisplay(display)
 		if err != nil {
 			// First display failing is a real error (permission, no display).
 			if display == 1 {
@@ -495,7 +453,7 @@ func ScreenshotAllDisplaysMacos() ([]shuffle.ScreenshotWrapper, error) {
 
 
 		screens = append(screens, shuffle.ScreenshotWrapper{
-			Image: png,
+			Image: img,
 			Cursor: cursorPosition,
 			//ElementTree: elementTree,
 		})
@@ -509,7 +467,8 @@ func ScreenshotAllDisplaysMacos() ([]shuffle.ScreenshotWrapper, error) {
 		if debug { 
 			log.Printf("[DEBUG] Captured display %d, size: %dx%d\n", display, screens[len(screens)-1].ScreenSize.Width, screens[len(screens)-1].ScreenSize.Height)
 		}
-		break
+
+		//break
 	}
 
 	return screens, nil
@@ -776,4 +735,152 @@ func IsDiskEncrypted() bool {
 	}
 
 	return result
+}
+
+func remoteControlExecute(a shuffle.RemoteControl) {
+	switch a.Op {
+
+	// -------- Mouse --------
+
+	case "mouse.move":
+		x := getInt(a.Params, "x")
+		y := getInt(a.Params, "y")
+		setCursor(x, y)
+
+	case "mouse.click":
+		x := getInt(a.Params, "x")
+		y := getInt(a.Params, "y")
+		button := getString(a.Params, "button")
+		delay := getInt(a.Params, "delay_ms")
+
+		setCursor(x, y)
+		time.Sleep(time.Duration(delay) * time.Millisecond)
+
+		mouseDown(button)
+		time.Sleep(50 * time.Millisecond)
+		mouseUp(button)
+
+	case "mouse.drag":
+		fx := getInt(a.Params, "from_x")
+		fy := getInt(a.Params, "from_y")
+		tx := getInt(a.Params, "to_x")
+		ty := getInt(a.Params, "to_y")
+		button := getString(a.Params, "button")
+
+		setCursor(fx, fy)
+		time.Sleep(50 * time.Millisecond)
+
+		mouseDown(button)
+		time.Sleep(50 * time.Millisecond)
+
+		setCursor(tx, ty)
+		time.Sleep(50 * time.Millisecond)
+
+		mouseUp(button)
+
+	// -------- Keyboard --------
+
+	case "keyboard.press":
+		//key := getInt(a.Params, "key")
+		//keyPress(uint16(key))
+		keys := parseKeys(a.Params["key"])
+		keyPress(keys...)
+
+	// -------- Utility --------
+
+	case "system.wait":
+		ms := getInt(a.Params, "ms")
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+/*
+func keyPress(vk uint16) {
+	macCode, ok := vkToMacKeyCode[vk]
+	if !ok {
+		// Fallback: If code is not in the map, pass directly
+		macCode = C.CGKeyCode(vk)
+	}
+
+	C.NativeKeyEvent(macCode, true)
+	time.Sleep(30 * time.Millisecond)
+	C.NativeKeyEvent(macCode, false)
+}
+*/
+
+func parseKeys(param interface{}) []uint16 {
+	switch v := param.(type) {
+
+	// Single keycode passed as a number
+	case float64: // JSON numbers unmarshal into float64
+		return []uint16{uint16(v)}
+	case int:
+		return []uint16{uint16(v)}
+
+	// String shortcut passed (e.g. "Control+Tab")
+	case string:
+		return parseShortcutString(v)
+
+	// Array of keycodes passed (e.g. [59, 48])
+	case []interface{}:
+		var keys []uint16
+		for _, item := range v {
+			if num, ok := item.(float64); ok {
+				keys = append(keys, uint16(num))
+			}
+		}
+		return keys
+	}
+
+	return nil
+}
+
+func parseShortcutString(shortcut string) []uint16 {
+	parts := strings.Split(shortcut, "+")
+	vks := make([]uint16, 0, len(parts))
+
+	for _, p := range parts {
+		clean := strings.ToLower(strings.TrimSpace(p))
+		if vk, ok := keyNameToVK[clean]; ok {
+			vks = append(vks, vk)
+		}
+	}
+	return vks
+}
+
+func keyDown(vk uint16) {
+	macCode, ok := vkToMacKeyCode[vk]
+	if !ok {
+		macCode = C.CGKeyCode(vk)
+	}
+	C.NativeKeyEvent(macCode, true)
+}
+
+func keyUp(vk uint16) {
+	macCode, ok := vkToMacKeyCode[vk]
+	if !ok {
+		macCode = C.CGKeyCode(vk)
+	}
+	C.NativeKeyEvent(macCode, false)
+}
+
+// keyPress now handles single or multiple key codes
+func keyPress(vks ...uint16) {
+	if len(vks) == 0 {
+		return
+	}
+
+	// 1. Press all keys down in order
+	for _, vk := range vks {
+		keyDown(vk)
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	// 2. Release all keys in REVERSE order
+	for i := len(vks) - 1; i >= 0; i-- {
+		keyUp(vks[i])
+		time.Sleep(15 * time.Millisecond)
+	}
 }

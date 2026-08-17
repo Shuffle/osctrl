@@ -57,6 +57,123 @@ type StreamFn func(line string)
 // Helpers
 // ========================
 
+// Base map using standard Windows VK codes as the universal standard.
+var keyNameToVK = map[string]uint16{
+
+	// -------- Modifiers & OS Keys --------
+	"ctrl":       0x11, // VK_CONTROL
+	"control":    0x11,
+	"lctrl":      0xA0, // VK_LCONTROL
+	"rctrl":      0xA1, // VK_RCONTROL
+	"shift":      0x10, // VK_SHIFT
+	"lshift":     0xA0, // VK_LSHIFT
+	"rshift":     0xA1, // VK_RSHIFT
+	"alt":        0x12, // VK_MENU
+	"option":     0x12,
+	"lalt":       0xA2, // VK_LMENU
+	"ralt":       0xA3, // VK_RMENU
+	"cmd":        0x5B, // VK_LWIN / macOS Command
+	"command":    0x5B,
+	"win":        0x5B, // Windows Key
+	"windows":    0x5B,
+	"super":      0x5B, // Linux Super key
+	"meta":       0x5B,
+
+	// -------- Action & System Keys --------
+	"enter":       0x0D, // VK_RETURN
+	"return":      0x0D,
+	"tab":         0x09, // VK_TAB
+	"space":       0x20, // VK_SPACE
+	"backspace":   0x08, // VK_BACK
+	"delete":      0x2E, // VK_DELETE
+	"del":         0x2E,
+	"esc":         0x1B, // VK_ESCAPE
+	"escape":      0x1B,
+	"capslock":    0x14, // VK_CAPITAL
+	"numlock":     0x90, // VK_NUMLOCK
+	"scrolllock":  0x91, // VK_SCROLL
+	"printscreen": 0x2C, // VK_SNAPSHOT
+	"prtsc":       0x2C,
+	"pause":       0x13, // VK_PAUSE
+
+	// -------- Navigation Keys --------
+	"up":       0x26, // VK_UP
+	"down":     0x28, // VK_DOWN
+	"left":     0x25, // VK_LEFT
+	"right":    0x27, // VK_RIGHT
+	"home":     0x24, // VK_HOME
+	"end":      0x23, // VK_END
+	"pageup":   0x21, // VK_PRIOR
+	"pgup":     0x21,
+	"pagedown": 0x22, // VK_NEXT
+	"pgdn":     0x22,
+	"insert":   0x2D, // VK_INSERT
+
+	// -------- Punctuation & Symbols --------
+	";":         0xBA, // VK_OEM_1
+	"semicolon": 0xBA,
+	"=":         0xBB, // VK_OEM_PLUS
+	"equals":    0xBB,
+	",":         0xBC, // VK_OEM_COMMA
+	"comma":     0xBC,
+	"-":         0xBD, // VK_OEM_MINUS
+	"minus":     0xBD,
+	".":         0xBE, // VK_OEM_PERIOD
+	"period":    0xBE,
+	"/":         0xBF, // VK_OEM_2
+	"slash":     0xBF,
+	"`":         0xC0, // VK_OEM_3
+	"backtick":  0xC0,
+	"tilde":     0xC0,
+	"[":         0xDB, // VK_OEM_4
+	"\\":        0xDC, // VK_OEM_5
+	"backslash": 0xDC,
+	"]":         0xDD, // VK_OEM_6
+	"'":         0xDE, // VK_OEM_7
+	"quote":     0xDE,
+
+	// -------- Numpad Operations --------
+	"num_add":      0x6B, // VK_ADD
+	"num_subtract": 0x6D, // VK_SUBTRACT
+	"num_multiply": 0x6A, // VK_MULTIPLY
+	"num_divide":   0x6F, // VK_DIVIDE
+	"num_decimal":  0x6E, // VK_DECIMAL
+
+	// -------- Media Keys --------
+	"mute":       0xAD, // VK_VOLUME_MUTE
+	"volumedown": 0xAE, // VK_VOLUME_DOWN
+	"volumeup":   0xAF, // VK_VOLUME_UP
+	"nexttrack":  0xB0, // VK_MEDIA_NEXT_TRACK
+	"prevtrack":  0xB1, // VK_MEDIA_PREV_TRACK
+	"mediastop":  0xB2, // VK_MEDIA_STOP
+	"playpause":  0xB3, // VK_MEDIA_PLAY_PAUSE
+}
+
+// Auto-populate letters, numbers, function keys, and numpad digits to avoid boilerplate
+func init() {
+	// Top Row Numbers: '0'-'9' (VK 0x30 to 0x39)
+	for i := 0; i <= 9; i++ {
+		keyNameToVK[fmt.Sprintf("%d", i)] = uint16(0x30 + i)
+	}
+
+	// Alphabet: 'a'-'z' (VK 0x41 to 0x5A)
+	for i := 0; i < 26; i++ {
+		char := string(rune('a' + i))
+		keyNameToVK[char] = uint16(0x41 + i)
+	}
+
+	// Function Keys: F1 - F24 (VK 0x70 to 0x87)
+	for i := 1; i <= 24; i++ {
+		keyNameToVK[fmt.Sprintf("f%d", i)] = uint16(0x70 + (i - 1))
+	}
+
+	// Numpad Digits: num0 - num9 (VK 0x60 to 0x69)
+	for i := 0; i <= 9; i++ {
+		keyNameToVK[fmt.Sprintf("num%d", i)] = uint16(0x60 + i)
+		keyNameToVK[fmt.Sprintf("numpad%d", i)] = uint16(0x60 + i)
+	}
+}
+
 func getInt(m map[string]any, key string) int {
 	if v, ok := m[key]; ok {
 		switch t := v.(type) {
