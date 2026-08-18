@@ -63,7 +63,6 @@ static void NativeKeyEvent(CGKeyCode keycode, bool keyDown) {
 */
 import "C"
 import (
-	"github.com/shuffle/shuffle-shared"
 	"os"
 	"time"
 	"fmt"
@@ -77,6 +76,13 @@ import (
 	"runtime"
 	"bytes"
 	"strconv"
+
+	"github.com/shuffle/shuffle-shared"
+
+	// In case we want a macos app. 
+	// Problem: It becomes the main loop rather than orborus itself.
+	//"encoding/base64"
+	//"fyne.io/systray"
 )
 
 var debug bool = os.Getenv("DEBUG") == "1"
@@ -884,3 +890,65 @@ func keyPress(vks ...uint16) {
 		time.Sleep(15 * time.Millisecond)
 	}
 }
+
+/*
+func init() { 
+	systray.Run(onReady, onExit)
+}
+
+func onReady() { 
+	log.Printf("[INFO] Systray starting")
+
+	iconBytes, err := base64.StdEncoding.DecodeString(iconBase64)
+	if err != nil {
+		log.Printf("[ERROR] Failed to decode icon: %v", err)
+		systray.SetTitle("Shuffle")
+	} else {
+		// Do NOT call SetTitle(). Just set the icon!
+		// SetTemplateIcon enables macOS Light/Dark mode auto-coloring.
+		systray.SetTemplateIcon(iconBytes, iconBytes)
+	}
+
+	systray.SetTooltip("My Go Menu Bar App")
+
+	// If you have icon bytes (PNG):
+	// iconData, _ := os.ReadFile("icon.png")
+	// systray.SetTemplateIcon(iconData, iconData) // Template icons automatically adjust for Dark/Light mode
+
+	// Add menu items
+	mToggle := systray.AddMenuItem("Toggle Feature", "Enable or disable feature")
+	mShowInfo := systray.AddMenuItem("Show Info", "Print info to terminal")
+	systray.AddSeparator()
+	mQuit := systray.AddMenuItem("Quit", "Quit the app")
+
+	// Handle click events in a goroutine
+	go func() {
+		for {
+			select {
+			case <-mToggle.ClickedCh:
+				if mToggle.Checked() {
+					mToggle.Uncheck()
+					fmt.Println("Feature Disabled")
+				} else {
+					mToggle.Check()
+					fmt.Println("Feature Enabled")
+				}
+
+			case <-mShowInfo.ClickedCh:
+				fmt.Println("Clicked Show Info!")
+
+			case <-mQuit.ClickedCh:
+				systray.Quit()
+				return
+			}
+		}
+	}()
+
+	log.Printf("[INFO] Systray started")
+}
+
+func onExit() {
+	// Clean up resources if needed
+	os.Exit(0)
+}
+*/
