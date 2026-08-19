@@ -60,6 +60,45 @@ static void NativeKeyEvent(CGKeyCode keycode, bool keyDown) {
         CFRelease(event);
     }
 }
+
+static inline void NativeTypeText(UniChar *chars, size_t length) {
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+
+    for (size_t i = 0; i < length; i++) {
+        // 1. Key Down
+        CGEventRef keyDown = CGEventCreateKeyboardEvent(source, 0, true);
+        CGEventKeyboardSetUnicodeString(keyDown, 1, &chars[i]);
+        CGEventPost(kCGHIDEventTap, keyDown);
+        CFRelease(keyDown);
+
+        // 5ms press duration so the OS registers the key down state
+        usleep(5000);
+
+        // 2. Key Up
+        CGEventRef keyUp = CGEventCreateKeyboardEvent(source, 0, false);
+        CGEventKeyboardSetUnicodeString(keyUp, 1, &chars[i]);
+        CGEventPost(kCGHIDEventTap, keyUp);
+        CFRelease(keyUp);
+
+        // 15ms buffer between characters (prevents event queue scrambling)
+        usleep(15000);
+    }
+
+    if (source) CFRelease(source);
+}
+
+void NativeKeyEventWithFlags(uint16_t keyCode, bool isDown, uint64_t flags) {
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    CGEventRef event = CGEventCreateKeyboardEvent(source, (CGKeyCode)keyCode, isDown);
+
+    if (flags != 0) {
+        CGEventSetFlags(event, (CGEventFlags)flags);
+    }
+
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+    if (source) CFRelease(source);
+}
 */
 import "C"
 import (
@@ -76,6 +115,7 @@ import (
 	"runtime"
 	"bytes"
 	"strconv"
+	"unicode/utf16"
 
 	"github.com/shuffle/shuffle-shared"
 
@@ -86,6 +126,60 @@ import (
 )
 
 var debug bool = os.Getenv("DEBUG") == "1"
+
+func typeText(text string) {
+	utf16Runes := utf16.Encode([]rune(text))
+	if len(utf16Runes) == 0 {
+		return
+	}
+	C.NativeTypeText((*C.UniChar)(&utf16Runes[0]), C.size_t(len(utf16Runes)))
+}
+
+// Helper: Safely converts string or []interface{} into a single string
+func extractString(param interface{}) string {
+	switch v := param.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var parts []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, " ")
+	}
+	return ""
+}
+
+// Helper: Safely extracts key slices from "cmd,t", ["cmd", "t"], or "Enter"
+func extractStringSlice(param interface{}) []string {
+	switch v := param.(type) {
+	case string:
+		if strings.Contains(v, ",") {
+			rawParts := strings.Split(v, ",")
+			var result []string
+			for _, p := range rawParts {
+				trimmed := strings.TrimSpace(p)
+				if trimmed != "" {
+					result = append(result, trimmed)
+				}
+			}
+			return result
+		}
+		return []string{strings.TrimSpace(v)}
+
+	case []interface{}:
+		var result []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				result = append(result, strings.TrimSpace(s))
+			}
+		}
+		return result
+	}
+	return nil
+}
 
 // GetCursorPositionMacos returns the current cursor position in global screen
 // coordinates using native macOS CoreGraphics. The origin (0,0) is the top-left of the
@@ -110,6 +204,7 @@ func GetCursorPositionMacos() (shuffle.Position, error) {
 func remoteControlBatch(batch shuffle.RemoteControlActionBatch) error {
 	for _, a := range batch.Actions {
 		remoteControlExecute(a)
+		time.Sleep(time.Duration(100) * time.Millisecond)
 	}
 
 	return nil
@@ -743,6 +838,54 @@ func IsDiskEncrypted() bool {
 	return result
 }
 
+func parseHotkeyParams(param interface{}) []string {
+	switch v := param.(type) {
+
+	// Single key string passed: "Enter" or "Tab"
+	case string:
+		return []string{v}
+
+	// Array of key strings passed: ["Control", "Tab"]
+	case []interface{}:
+		keys := make([]string, 0, len(v))
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				keys = append(keys, str)
+			}
+		}
+
+		return keys
+
+	// Array directly unmarshaled as []string
+	case []string:
+		return v
+	}
+
+	return nil
+}
+
+var macKeyNameToCode = map[string]uint16{
+	// Modifiers
+	"cmd": 55, "command": 55, "win": 55, "meta": 55,
+	"shift": 56, "lshift": 56, "rshift": 60,
+	"alt": 58, "option": 58, "lalt": 58, "ralt": 61,
+	"ctrl": 59, "control": 59, "lctrl": 59, "rctrl": 62,
+
+	// Common Letters (macOS native keycodes)
+	"a": 0, "b": 11, "c": 8, "d": 2, "e": 14, "f": 3, "g": 5, "h": 4,
+	"i": 34, "j": 38, "k": 40, "l": 37, "m": 46, "n": 45, "o": 31, "p": 35,
+	"q": 12, "r": 15, "s": 1, "t": 17, "u": 32, "v": 9, "w": 13, "x": 7,
+	"y": 16, "z": 6,
+
+	// Numbers
+	"0": 29, "1": 18, "2": 19, "3": 20, "4": 21,
+	"5": 23, "6": 22, "7": 26, "8": 28, "9": 25,
+
+	// Action Keys
+	"return": 36, "enter": 36, "tab": 48, "space": 49,
+	"backspace": 51, "delete": 117, "esc": 53, "escape": 53,
+}
+
 func remoteControlExecute(a shuffle.RemoteControl) {
 	switch a.Op {
 
@@ -784,74 +927,31 @@ func remoteControlExecute(a shuffle.RemoteControl) {
 
 		mouseUp(button)
 
-	// -------- Keyboard --------
+	case "keyboard.type":
+		text := extractString(a.Params["keys"])
+		if text != "" {
+			typeText(text)
+		}
 
-	case "keyboard.press":
-		//key := getInt(a.Params, "key")
-		//keyPress(uint16(key))
-		keys := parseKeys(a.Params["key"])
-		keyPress(keys...)
+	case "keyboard.hotkey":
+		keySlice := extractStringSlice(a.Params["keys"])
+		macCodes := make([]uint16, 0, len(keySlice))
+
+		for _, k := range keySlice {
+			if code, ok := macKeyNameToCode[strings.ToLower(k)]; ok {
+				macCodes = append(macCodes, code)
+			}
+		}
+
+		if len(macCodes) > 0 {
+			keyPressCombo(macCodes...)
+		}
 
 	// -------- Utility --------
-
 	case "system.wait":
 		ms := getInt(a.Params, "ms")
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
-}
-
-/*
-func keyPress(vk uint16) {
-	macCode, ok := vkToMacKeyCode[vk]
-	if !ok {
-		// Fallback: If code is not in the map, pass directly
-		macCode = C.CGKeyCode(vk)
-	}
-
-	C.NativeKeyEvent(macCode, true)
-	time.Sleep(30 * time.Millisecond)
-	C.NativeKeyEvent(macCode, false)
-}
-*/
-
-func parseKeys(param interface{}) []uint16 {
-	switch v := param.(type) {
-
-	// Single keycode passed as a number
-	case float64: // JSON numbers unmarshal into float64
-		return []uint16{uint16(v)}
-	case int:
-		return []uint16{uint16(v)}
-
-	// String shortcut passed (e.g. "Control+Tab")
-	case string:
-		return parseShortcutString(v)
-
-	// Array of keycodes passed (e.g. [59, 48])
-	case []interface{}:
-		var keys []uint16
-		for _, item := range v {
-			if num, ok := item.(float64); ok {
-				keys = append(keys, uint16(num))
-			}
-		}
-		return keys
-	}
-
-	return nil
-}
-
-func parseShortcutString(shortcut string) []uint16 {
-	parts := strings.Split(shortcut, "+")
-	vks := make([]uint16, 0, len(parts))
-
-	for _, p := range parts {
-		clean := strings.ToLower(strings.TrimSpace(p))
-		if vk, ok := keyNameToVK[clean]; ok {
-			vks = append(vks, vk)
-		}
-	}
-	return vks
 }
 
 func keyDown(vk uint16) {
@@ -888,6 +988,54 @@ func keyPress(vks ...uint16) {
 	for i := len(vks) - 1; i >= 0; i-- {
 		keyUp(vks[i])
 		time.Sleep(15 * time.Millisecond)
+	}
+}
+
+const (
+	FlagCommand = 1 << 20 // kCGEventFlagMaskCommand (0x00100000)
+	FlagShift   = 1 << 17 // kCGEventFlagMaskShift   (0x00020000)
+	FlagAlt     = 1 << 19 // kCGEventFlagMaskAlternate (0x00080000)
+	FlagControl = 1 << 18 // kCGEventFlagMaskControl (0x00040000)
+)
+
+func getModifierFlag(macCode uint16) uint64 {
+	switch macCode {
+	case 55:
+		return FlagCommand
+	case 56, 60:
+		return FlagShift
+	case 58, 61:
+		return FlagAlt
+	case 59, 62:
+		return FlagControl
+	default:
+		return 0
+	}
+}
+
+// Executes multi-key combos with appropriate macOS modifier flags
+func keyPressCombo(vks ...uint16) {
+	if len(vks) == 0 {
+		return
+	}
+
+	var currentFlags uint64
+
+	// 1. Press keys down & accumulate modifier flags
+	for _, vk := range vks {
+		currentFlags |= getModifierFlag(vk)
+		C.NativeKeyEventWithFlags(C.uint16_t(vk), true, C.uint64_t(currentFlags))
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	time.Sleep(30 * time.Millisecond)
+
+	// 2. Release keys in reverse order
+	for i := len(vks) - 1; i >= 0; i-- {
+		vk := vks[i]
+		C.NativeKeyEventWithFlags(C.uint16_t(vk), false, C.uint64_t(currentFlags))
+		currentFlags &^= getModifierFlag(vk) // Clear flag
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
