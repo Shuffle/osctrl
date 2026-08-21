@@ -2,10 +2,33 @@
 
 package osctrl 
 
+import (
+	"os"
+	"fmt"
+	"log"
+	"time"
+	"errors"
+	"strings"
+	"unicode/utf16"
+	"encoding/json"
+	"path/filepath"
+
+	"os/exec"
+	"runtime"
+	"bytes"
+
+	"github.com/shuffle/shuffle-shared"
+
+	// In case we want a macos app. 
+	// Problem: It becomes the main loop rather than orborus itself.
+	//"encoding/base64"
+	//"fyne.io/systray"
+)
+
 /*
 #cgo LDFLAGS: -framework ApplicationServices -framework CoreFoundation
-
 #include <ApplicationServices/ApplicationServices.h>
+#include <CoreGraphics/CoreGraphics.h>
 
 static int GetNativeCursorPosition(double *x, double *y) {
     CGEventRef event = CGEventCreate(NULL);
@@ -99,31 +122,116 @@ void NativeKeyEventWithFlags(uint16_t keyCode, bool isDown, uint64_t flags) {
     CFRelease(event);
     if (source) CFRelease(source);
 }
+
+typedef struct {
+    double x, y, w, h;
+    char role[64];
+    char label[128];
+    int error_code;
+} CElement;
+
+// Pure C: Find the PID of the top-most visible window
+static pid_t get_frontmost_pid_pure_c() {
+    pid_t pid = 0;
+    CFArrayRef windowList = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, 
+        kCGNullWindowID
+    );
+    
+    if (!windowList) return 0;
+
+    CFIndex count = CFArrayGetCount(windowList);
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, i);
+        
+        // Skip system overlays and dock (Layer 0 is standard app windows)
+        CFNumberRef layerRef = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowLayer);
+        int layer = 0;
+        if (layerRef) CFNumberGetValue(layerRef, kCFNumberIntType, &layer);
+        if (layer != 0) continue;
+
+        // Extract owner PID
+        CFNumberRef pidRef = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowOwnerPID);
+        if (pidRef) {
+            CFNumberGetValue(pidRef, kCFNumberIntType, &pid);
+            if (pid > 0) break;
+        }
+    }
+    
+    CFRelease(windowList);
+    return pid;
+}
+
+static CElement get_frontmost_app_ui_element() {
+    CElement out = {0};
+
+    if (!AXIsProcessTrusted()) {
+        out.error_code = -1; // Missing TCC permissions
+        return out;
+    }
+
+    pid_t pid = get_frontmost_pid_pure_c();
+    if (pid == 0) {
+        out.error_code = -25204;
+        return out;
+    }
+
+    AXUIElementRef appElem = AXUIElementCreateApplication(pid);
+    if (!appElem) {
+        out.error_code = -25201;
+        return out;
+    }
+
+    AXUIElementRef targetElem = NULL;
+    AXError err = AXUIElementCopyAttributeValue(appElem, kAXFocusedWindowAttribute, (CFTypeRef*)&targetElem);
+    if (err != kAXErrorSuccess || !targetElem) {
+        err = AXUIElementCopyAttributeValue(appElem, kAXMainWindowAttribute, (CFTypeRef*)&targetElem);
+    }
+    if (err != kAXErrorSuccess || !targetElem) {
+        targetElem = appElem;
+        CFRetain(targetElem);
+    }
+
+    // Extract Title / Label
+    CFTypeRef titleVal = NULL;
+    if (AXUIElementCopyAttributeValue(targetElem, kAXTitleAttribute, &titleVal) == kAXErrorSuccess && titleVal) {
+        CFStringGetCString((CFStringRef)titleVal, out.label, sizeof(out.label), kCFStringEncodingUTF8);
+        CFRelease(titleVal);
+    }
+
+    // Extract Role
+    CFTypeRef roleVal = NULL;
+    if (AXUIElementCopyAttributeValue(targetElem, kAXRoleAttribute, &roleVal) == kAXErrorSuccess && roleVal) {
+        CFStringGetCString((CFStringRef)roleVal, out.role, sizeof(out.role), kCFStringEncodingUTF8);
+        CFRelease(roleVal);
+    }
+
+    // Extract Position and Size
+    AXValueRef posVal = NULL, sizeVal = NULL;
+    CGPoint pt = CGPointZero;
+    CGSize sz = CGSizeZero;
+
+    if (AXUIElementCopyAttributeValue(targetElem, kAXPositionAttribute, (CFTypeRef*)&posVal) == kAXErrorSuccess && posVal) {
+        AXValueGetValue(posVal, kAXValueTypeCGPoint, &pt);
+        out.x = pt.x; out.y = pt.y;
+        CFRelease(posVal);
+    }
+
+    if (AXUIElementCopyAttributeValue(targetElem, kAXSizeAttribute, (CFTypeRef*)&sizeVal) == kAXErrorSuccess && sizeVal) {
+        AXValueGetValue(sizeVal, kAXValueTypeCGSize, &sz);
+        out.w = sz.width; out.h = sz.height;
+        CFRelease(sizeVal);
+    }
+
+    CFRelease(targetElem);
+    CFRelease(appElem);
+
+    out.error_code = 0;
+    return out;
+}
 */
-import "C"
-import (
-	"os"
-	"time"
-	"fmt"
-	"strings"
-	"errors"
-	"log"
-	"encoding/json"
-	"path/filepath"
+import "C" 
 
-	"os/exec"
-	"runtime"
-	"bytes"
-	"strconv"
-	"unicode/utf16"
-
-	"github.com/shuffle/shuffle-shared"
-
-	// In case we want a macos app. 
-	// Problem: It becomes the main loop rather than orborus itself.
-	//"encoding/base64"
-	//"fyne.io/systray"
-)
 
 var debug bool = os.Getenv("DEBUG") == "1"
 
@@ -466,21 +574,6 @@ func getDisplaySizeMacos() ([]shuffle.DisplaySize, error) {
 	return sizes, nil
 }
 
-func GetFrontmostPIDShell() (int, error) {
-	script := `tell application "System Events" to get unix id of first application process whose frontmost is true`
-	cmd := exec.Command("osascript", "-e", script)
-
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
-	if err != nil {
-		return 0, err
-	}
-
-	pidStr := strings.TrimSpace(out.String())
-	return strconv.Atoi(pidStr)
-}
-
 // captureDisplay captures a single display by 1-based index.
 func captureDisplay(display int) ([]byte, error) {
 	path := filepath.Join(
@@ -509,115 +602,6 @@ func captureDisplay(display int) ([]byte, error) {
 
 	return data, nil
 }
-
-// ScreenshotAllDisplays captures every active display and returns one PNG
-// per display. Display indices are 1-based in screencapture; we probe until
-// the tool produces no output, which is how it signals an out-of-range index.
-func ScreenshotAllDisplaysMacos() ([]shuffle.ScreenshotWrapper, error) {
-	var screens []shuffle.ScreenshotWrapper
-
-	cursorPosition, err := GetCursorPositionMacos()
-	if err != nil {
-		log.Printf("[WARN] Unable to get cursor position: %v\n", err)
-	}
-
-	screenSizes, err := getDisplaySizeMacos()
-	if err != nil {
-		log.Printf("[WARN] Unable to get display sizes: %v\n", err)
-	}
-
-	/*
-	elementTree := make([]*C.AXUIElementRef, 0)
-	targetPID, err := GetFrontmostPIDShell()
-	if err != nil {
-		log.Printf("[WARN] Unable to get frontmost PID: %v\n", err)
-	} else {
-		appRef := C.AXUIElementCreateApplication(C.pid_t(targetPID))
-		defer C.CFRelease(C.CFTypeRef(appRef))
-		elementTree, err = traverseAXTree(appRef)
-		if err != nil {
-			log.Printf("[WARN] Unable to traverse AX tree: %v\n", err)
-		}
-	}
-	*/
-
-	for display := 1; ; display++ {
-		img, err := captureDisplay(display)
-		if err != nil {
-			// First display failing is a real error (permission, no display).
-			if display == 1 {
-				return nil, err
-			}
-
-			break
-		}
-
-
-		screens = append(screens, shuffle.ScreenshotWrapper{
-			Image: img,
-			Cursor: cursorPosition,
-			//ElementTree: elementTree,
-		})
-
-		if len(screenSizes) >= display {
-			screens[len(screens)-1].ScreenSize.Width = screenSizes[display-1].Width
-			screens[len(screens)-1].ScreenSize.Height = screenSizes[display-1].Height
-		}
-
-		// Just doing a single screen
-		if debug { 
-			log.Printf("[DEBUG] Captured display %d, size: %dx%d\n", display, screens[len(screens)-1].ScreenSize.Width, screens[len(screens)-1].ScreenSize.Height)
-		}
-
-		//break
-	}
-
-	return screens, nil
-}
-
-// Node mirrors the CDP AXNode concept mapped to macOS native fields
-/*
-type AXNode struct {
-	ID       string    `json:"nodeId"`
-	Role     string    `json:"role"`
-	Title    string    `json:"title,omitempty"`
-	Children []AXNode  `json:"children,omitempty"`
-}
-
-func traverseAXTree(element C.AXUIElementRef) AXNode {
-	node := AXNode{}
-
-	// 1. Get Role
-	roleCF := C.copy_string_attribute(element, C.kAXRoleAttribute)
-	if roleCF != 0 {
-		node.Role = GoStringFromCFString(roleCF)
-		C.CFRelease(C.CFTypeRef(roleCF))
-	}
-
-	// 2. Get Title
-	titleCF := C.copy_string_attribute(element, C.kAXTitleAttribute)
-	if titleCF != 0 {
-		node.Title = GoStringFromCFString(titleCF)
-		C.CFRelease(C.CFTypeRef(titleCF))
-	}
-
-	// 3. Get Children
-	var childrenRef C.CFTypeRef
-	if C.AXUIElementCopyAttributeValue(element, C.kAXChildrenAttribute, &childrenRef) == C.kAXErrorSuccess {
-		if C.CFGetTypeID(childrenRef) == C.CFArrayGetTypeID() {
-			array := C.CFArrayRef(childrenRef)
-			count := C.CFArrayGetCount(array)
-			for i := C.CFIndex(0); i < count; i++ {
-				child := C.AXUIElementRef(C.CFArrayGetValueAtIndex(array, i))
-				node.Children = append(node.Children, traverseAXTree(child))
-			}
-		}
-		C.CFRelease(childrenRef)
-	}
-
-	return node
-}
-*/
 
 func GetProfiler() string {
 	return getProfileMac()
@@ -1100,3 +1084,83 @@ func onExit() {
 	os.Exit(0)
 }
 */
+
+// ScreenshotAllDisplays captures every active display and returns one PNG
+// per display. Display indices are 1-based in screencapture; we probe until
+// the tool produces no output, which is how it signals an out-of-range index.
+func ScreenshotAllDisplaysMacos() ([]shuffle.ScreenshotWrapper, error) {
+	var screens []shuffle.ScreenshotWrapper
+
+	cursorPosition, err := GetCursorPositionMacos()
+	if err != nil {
+		log.Printf("[WARNING] Unable to get cursor position: %v\n", err)
+	}
+
+	screenSizes, err := getDisplaySizeMacos()
+	if err != nil {
+		log.Printf("[WARNING] Unable to get display sizes: %v\n", err)
+	}
+
+	for display := 1; ; display++ {
+		img, err := captureDisplay(display)
+		if err != nil {
+			// First display failing is a real error (permission, no display).
+			if display == 1 {
+				return nil, err
+			}
+
+			break
+		}
+
+		screen := shuffle.ScreenshotWrapper{
+			Image: img,
+			Cursor: cursorPosition,
+		}
+
+		elementTree, err := FetchFocusedElement(display, 10)
+		if err != nil { 
+			log.Printf("[ERROR] Focused tree problem for screen %d: %#v", display, err)
+		}
+		if elementTree != nil {
+			screen.ElementTree = *elementTree
+		}
+
+		if len(screenSizes) >= display {
+			screen.ScreenSize.Width = screenSizes[display-1].Width
+			screen.ScreenSize.Height = screenSizes[display-1].Height
+		}
+
+		screens = append(screens, screen)
+
+		// Just doing a single screen
+		if debug { 
+			log.Printf("[DEBUG] Captured display %d, size: %dx%d\n", display, screens[len(screens)-1].ScreenSize.Width, screens[len(screens)-1].ScreenSize.Height)
+		}
+
+		//break
+	}
+
+	return screens, nil
+}
+
+func FetchFocusedElement() (*shuffle.UIElement, error) {
+	res := C.get_frontmost_app_ui_element()
+	if res.error_code == -1 {
+		return nil, fmt.Errorf("accessibility permission denied. Enable Terminal/IDE in System Settings > Privacy & Security > Accessibility")
+	}
+
+	if res.error_code != 0 {
+		return nil, fmt.Errorf("AXError returned code: %d", int(res.error_code))
+	}
+
+	return &shuffle.UIElement{
+		Label: C.GoString(&res.label[0]),
+		Role:  shuffle.ElementRole(C.GoString(&res.role[0])),
+		Bounds: shuffle.Rect{
+			X:      float64(res.x),
+			Y:      float64(res.y),
+			Width:  float64(res.w),
+			Height: float64(res.h),
+		},
+	}, nil
+}
