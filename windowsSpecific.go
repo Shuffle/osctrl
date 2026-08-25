@@ -14,9 +14,7 @@ import (
 	"io"
 	"errors"
 	"fmt"
-	"regexp"
 	"path/filepath"
-	"bufio"
 	"io/fs"
 
 	"unsafe" // for pointer control. Not ideal, but ok
@@ -24,9 +22,10 @@ import (
 	"os/exec"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+	"github.com/shuffle/shuffle-shared"
 )
 
-func scanRegistryUninstall() []Software {
+func scanRegistryUninstall() []shuffle.Software {
 	roots := []struct {
 		key  registry.Key
 		path string
@@ -38,7 +37,7 @@ func scanRegistryUninstall() []Software {
 		{registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Uninstall`, 0, "registry-cu"},
 	}
 
-	var out []Software
+	var out []shuffle.Software
 
 	for _, r := range roots {
 		k, err := registry.OpenKey(r.key, r.path, registry.READ|r.flag)
@@ -65,7 +64,7 @@ func scanRegistryUninstall() []Software {
 				continue
 			}
 
-			out = append(out, Software{
+			out = append(out, shuffle.Software{
 				Name:    name,
 				Version: version,
 				Path:    path,
@@ -92,7 +91,7 @@ var appxSkipPrefixes = []string{
     "MicrosoftCorporationII.",
 }
 
-func scanAppx() []Software {
+func scanAppx() []shuffle.Software {
     cmd := `Get-AppxPackage | Select Name, Version | ConvertTo-Json -Compress`
     out, err := exec.Command("powershell", "-NoProfile", "-Command", cmd).Output()
     if err != nil || len(out) == 0 {
@@ -115,12 +114,12 @@ func scanAppx() []Software {
         packages = []pkg{single}
     }
 
-    var res []Software
+    var res []shuffle.Software
     for _, p := range packages {
         if isInfraAppx(p.Name) {
             continue
         }
-        res = append(res, Software{
+        res = append(res, shuffle.Software{
             Name:    p.Name,
             Version: p.Version,
             Source:  "appx",
@@ -143,8 +142,8 @@ var roots = []string{
 	`C:\Program Files (x86)`,
 }
 
-func scanProgramFiles() []Software {
-	var out []Software
+func scanProgramFiles() []shuffle.Software {
+	var out []shuffle.Software
 
 	for _, root := range roots {
 		filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -170,7 +169,7 @@ func scanProgramFiles() []Software {
 				return nil
 			}
 
-			out = append(out, Software{
+			out = append(out, shuffle.Software{
 				Name:    name,
 				Version: version,
 				Path:    path,
@@ -264,7 +263,7 @@ func queryStringValue(buf []byte, key string) string {
 }
 
 
-func scanWinget() []Software {
+func scanWinget() []shuffle.Software {
     out, err := exec.Command(
         "winget", "list",
         "--disable-interactivity",
@@ -301,7 +300,7 @@ func scanWinget() []Software {
     }
 
     // Skip header + separator line (headerIdx+1 is "----")
-    var res []Software
+    var res []shuffle.Software
     for _, line := range lines[headerIdx+2:] {
         // Trim Windows line endings; skip short/empty lines
         line = strings.TrimRight(line, "\r")
@@ -315,7 +314,7 @@ func scanWinget() []Software {
         if name == "" {
             continue
         }
-        res = append(res, Software{
+        res = append(res, shuffle.Software{
             Name:    name,
             Version: version,
             Source:  "winget",
@@ -336,9 +335,9 @@ func columnSlice(line string, start, end int) string {
     return strings.TrimSpace(line[start:end])
 }
 
-func dedupe(in []Software) []Software {
+func dedupe(in []shuffle.Software) []shuffle.Software {
 	seen := map[string]bool{}
-	var out []Software
+	var out []shuffle.Software
 
 	for _, s := range in {
 		key := strings.ToLower(s.Name + "|" + s.Version)
@@ -352,8 +351,8 @@ func dedupe(in []Software) []Software {
 	return out
 }
 
-func ListInstalledSoftware() []Software {
-	var all []Software
+func ListInstalledSoftware() []shuffle.Software {
+	var all []shuffle.Software
 
 	all = append(all, scanRegistryUninstall()...)
 	all = append(all, scanAppx()...)
@@ -411,12 +410,7 @@ func isEncryptedWindows() bool {
 }
 
 func IsDiskEncrypted() bool {
-	switch runtime.GOOS {
-	case "windows":
-		return isEncryptedWindows()
-	default:
-		return false
-	}
+	return isEncryptedWindows()
 }
 
 func GetProfiler() string {
@@ -533,7 +527,7 @@ func (c *AuditLogCollector) LogCollectorStart(ctx context.Context) error {
 	return errors.New("Not implemented on windows") 
 }
 
-func NewAuditLogCollector(config TelemetryConfig) (*AuditLogCollector, error) {
+func NewAuditLogCollector(config shuffle.TelemetryConfig) (*AuditLogCollector, error) {
 	auditLogCollector := AuditLogCollector{}
 	return &auditLogCollector, errors.New("Not implemented on windows")
 }
@@ -684,18 +678,9 @@ func unisolateHost() error {
 }
 
 
-// ── Constructor ──────────────────────────────────────────────────────────────
-
-func NewScanner() *Scanner {
-	return &Scanner{
-		results: make(chan ProjectInfo),
-		visited: make(map[string]bool),
-	}
-}
-
 // ── Public entry point ───────────────────────────────────────────────────────
 
-func (s *Scanner) Scan(rootDir string) ([]ProjectInfo, error) {
+func (s *Scanner) Scan(rootDir string) ([]shuffle.ProjectInfo, error) {
 	absRoot, err := filepath.Abs(rootDir)
 	if err != nil {
 		return nil, fmt.Errorf("invalid root directory: %w", err)
@@ -704,7 +689,7 @@ func (s *Scanner) Scan(rootDir string) ([]ProjectInfo, error) {
 	s.wg.Add(1)
 	go s.scanDir(absRoot)
 
-	var results []ProjectInfo
+	var results []shuffle.ProjectInfo
 	done := make(chan struct{})
 	go func() {
 		for p := range s.results {
@@ -757,7 +742,7 @@ func (s *Scanner) scanDir(dir string) {
 
 		if projectType := detectProjectType(fullPath); projectType != "" {
 			packages := extractPackages(fullPath, projectType)
-			s.results <- ProjectInfo{
+			s.results <- shuffle.ProjectInfo{
 				Path:     fullPath,
 				Type:     projectType,
 				Packages: packages,
@@ -842,24 +827,24 @@ func shouldSkip(name string) bool {
 // ── Project detection ────────────────────────────────────────────────────────
 
 func detectProjectType(dir string) string {
-	if fileExists(filepath.Join(dir, "go.mod")) {
+	if shuffle.FileExists(filepath.Join(dir, "go.mod")) {
 		return "golang"
 	}
-	if fileExists(filepath.Join(dir, "pyproject.toml")) ||
-		fileExists(filepath.Join(dir, "requirements.txt")) ||
-		fileExists(filepath.Join(dir, "Pipfile")) {
+	if shuffle.FileExists(filepath.Join(dir, "pyproject.toml")) ||
+		shuffle.FileExists(filepath.Join(dir, "requirements.txt")) ||
+		shuffle.FileExists(filepath.Join(dir, "Pipfile")) {
 		return "python"
 	}
-	if fileExists(filepath.Join(dir, "package.json")) {
+	if shuffle.FileExists(filepath.Join(dir, "package.json")) {
 		return "javascript"
 	}
-	if fileExists(filepath.Join(dir, "pom.xml")) ||
-		fileExists(filepath.Join(dir, "build.gradle")) ||
-		fileExists(filepath.Join(dir, "build.gradle.kts")) {
+	if shuffle.FileExists(filepath.Join(dir, "pom.xml")) ||
+		shuffle.FileExists(filepath.Join(dir, "build.gradle")) ||
+		shuffle.FileExists(filepath.Join(dir, "build.gradle.kts")) {
 		return "java"
 	}
-	if fileExists(filepath.Join(dir, "Gemfile")) ||
-		fileExists(filepath.Join(dir, "Rakefile")) {
+	if shuffle.FileExists(filepath.Join(dir, "Gemfile")) ||
+		shuffle.FileExists(filepath.Join(dir, "Rakefile")) {
 		return "ruby"
 	}
 	// .NET: must ReadDir — glob patterns are not valid os.Stat paths.
@@ -878,7 +863,7 @@ func detectProjectType(dir string) string {
 
 // ── Dispatcher ───────────────────────────────────────────────────────────────
 
-func extractPackages(dir, projectType string) []Software {
+func extractPackages(dir, projectType string) []shuffle.Software {
 	switch projectType {
 	case "golang":
 		return extractGoPackages(dir)
@@ -896,375 +881,6 @@ func extractPackages(dir, projectType string) []Software {
 	return nil
 }
 
-// ── Go ───────────────────────────────────────────────────────────────────────
-
-func extractGoPackages(dir string) []Software {
-	f, err := os.Open(filepath.Join(dir, "go.mod"))
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	var pkgs []Software
-	sc := bufio.NewScanner(f)
-	inBlock := false
-
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-
-		switch {
-		case line == "require (":
-			inBlock = true
-
-		case line == ")" && inBlock:
-			inBlock = false
-
-		case strings.HasPrefix(line, "require ") && !inBlock:
-			// Single-line form: require github.com/foo/bar v1.2.3
-			parts := strings.Fields(line)
-			if len(parts) == 3 {
-				pkgs = append(pkgs, Software{Name: parts[1], Version: parts[2]})
-			}
-
-		case inBlock && line != "" && !strings.HasPrefix(line, "//"):
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				pkgs = append(pkgs, Software{Name: parts[0], Version: parts[1]})
-			} else if len(parts) == 1 {
-				pkgs = append(pkgs, Software{Name: parts[0]})
-			}
-		}
-	}
-	return pkgs
-}
-
-// ── Python ───────────────────────────────────────────────────────────────────
-
-func extractPythonPackages(dir string) []Software {
-	if data, err := os.ReadFile(filepath.Join(dir, "pyproject.toml")); err == nil {
-		if pkgs := parsePyprojectToml(string(data)); len(pkgs) > 0 {
-			return pkgs
-		}
-	}
-	if data, err := os.ReadFile(filepath.Join(dir, "requirements.txt")); err == nil {
-		if pkgs := parseRequirementsTxt(string(data)); len(pkgs) > 0 {
-			return pkgs
-		}
-	}
-	if data, err := os.ReadFile(filepath.Join(dir, "Pipfile")); err == nil {
-		return parsePipfile(string(data))
-	}
-	return nil
-}
-
-// versionOps are Python version specifier operators, longest-match first.
-var versionOps = []string{">=", "<=", "==", "~=", "!=", ">", "<", ";"}
-
-func splitPyDep(dep string) (name, version string) {
-	minIdx := len(dep)
-	for _, op := range versionOps {
-		if idx := strings.Index(dep, op); idx >= 0 && idx < minIdx {
-			minIdx = idx
-		}
-	}
-	if minIdx < len(dep) {
-		return strings.TrimSpace(dep[:minIdx]), strings.TrimSpace(dep[minIdx:])
-	}
-	return strings.TrimSpace(dep), ""
-}
-
-func parseRequirementsTxt(content string) []Software {
-	var pkgs []Software
-	sc := bufio.NewScanner(strings.NewReader(content))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "-") {
-			continue
-		}
-		// Strip inline comments.
-		if i := strings.Index(line, " #"); i >= 0 {
-			line = strings.TrimSpace(line[:i])
-		}
-		name, version := splitPyDep(line)
-		if name != "" {
-			pkgs = append(pkgs, Software{Name: name, Version: version})
-		}
-	}
-	return pkgs
-}
-
-func parsePyprojectToml(content string) []Software {
-	var pkgs []Software
-	inDeps := false
-	sc := bufio.NewScanner(strings.NewReader(content))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-
-		if strings.Contains(line, "[tool.poetry.dependencies]") ||
-			strings.Contains(line, "[project]") && strings.Contains(line, "requires") {
-			inDeps = true
-			continue
-		}
-		// Any new section ends deps block.
-		if inDeps && strings.HasPrefix(line, "[") {
-			inDeps = false
-		}
-		// Array-style: "django>=3.0"
-		if inDeps && strings.HasPrefix(line, `"`) {
-			raw := strings.Trim(line, `",`)
-			name, version := splitPyDep(raw)
-			if name != "" {
-				pkgs = append(pkgs, Software{Name: name, Version: version})
-			}
-		}
-		// TOML key = "version" style: django = ">=3.0"
-		if inDeps && strings.Contains(line, "=") && !strings.HasPrefix(line, "[") {
-			parts := strings.SplitN(line, "=", 2)
-			name := strings.TrimSpace(parts[0])
-			version := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-			if name != "" && name != "python" {
-				pkgs = append(pkgs, Software{Name: name, Version: version})
-			}
-		}
-	}
-	return pkgs
-}
-
-func parsePipfile(content string) []Software {
-	var pkgs []Software
-	inPackages := false
-	sc := bufio.NewScanner(strings.NewReader(content))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "[packages]" || line == "[dev-packages]" {
-			inPackages = true
-			continue
-		}
-		if inPackages && strings.HasPrefix(line, "[") {
-			inPackages = false
-		}
-		if inPackages && line != "" && strings.Contains(line, "=") {
-			parts := strings.SplitN(line, "=", 2)
-			name := strings.TrimSpace(parts[0])
-			version := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-			if name != "" {
-				pkgs = append(pkgs, Software{Name: name, Version: version})
-			}
-		}
-	}
-	return pkgs
-}
-
-// ── JavaScript / TypeScript ──────────────────────────────────────────────────
-
-func extractJavaScriptPackages(dir string) []Software {
-	data, err := os.ReadFile(filepath.Join(dir, "package.json"))
-	if err != nil {
-		return nil
-	}
-	var pkg struct {
-		Dependencies    map[string]string `json:"dependencies"`
-		DevDependencies map[string]string `json:"devDependencies"`
-	}
-	if err := json.Unmarshal(data, &pkg); err != nil {
-		return nil
-	}
-	var pkgs []Software
-	for n, v := range pkg.Dependencies {
-		pkgs = append(pkgs, Software{Name: n, Version: v})
-	}
-	for n, v := range pkg.DevDependencies {
-		pkgs = append(pkgs, Software{Name: n, Version: v})
-	}
-	return pkgs
-}
-
-// ── Java ─────────────────────────────────────────────────────────────────────
-
-func extractJavaPackages(dir string) []Software {
-	if data, err := os.ReadFile(filepath.Join(dir, "pom.xml")); err == nil {
-		return parsePomXml(string(data))
-	}
-	if data, err := os.ReadFile(filepath.Join(dir, "build.gradle")); err == nil {
-		return parseGradleBuild(string(data))
-	}
-	if data, err := os.ReadFile(filepath.Join(dir, "build.gradle.kts")); err == nil {
-		return parseGradleBuild(string(data))
-	}
-	return nil
-}
-
-// parsePomXml collects groupId:artifactId pairs from Maven pom.xml.
-// The original code only collected groupId, producing half-names like "org.springframework".
-func parsePomXml(content string) []Software {
-	var pkgs []Software
-	inDeps := false
-	var groupID, artifactID string
-
-	sc := bufio.NewScanner(strings.NewReader(content))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-
-		if strings.Contains(line, "<dependencies>") {
-			inDeps = true
-			continue
-		}
-		if strings.Contains(line, "</dependencies>") {
-			inDeps = false
-			groupID, artifactID = "", ""
-			continue
-		}
-		if strings.Contains(line, "</dependency>") {
-			groupID, artifactID = "", ""
-			continue
-		}
-
-		if !inDeps {
-			continue
-		}
-
-		if groupID == "" {
-			if v := extractXmlValue(line, "groupId"); v != "" {
-				groupID = v
-			}
-		}
-		if artifactID == "" {
-			if v := extractXmlValue(line, "artifactId"); v != "" {
-				artifactID = v
-			}
-		}
-
-		if groupID != "" && artifactID != "" {
-			version := extractXmlValue(line, "version")
-			pkgs = append(pkgs, Software{
-				Name:    groupID + ":" + artifactID,
-				Version: version,
-			})
-			groupID, artifactID = "", ""
-		}
-	}
-	return pkgs
-}
-
-// gradleDepRe matches both groovy and Kotlin DSL dependency strings:
-//
-//	implementation 'group:artifact:version'
-//	implementation("group:artifact:version")
-var gradleDepRe = regexp.MustCompile(`(?:implementation|compile|api|testImplementation|runtimeOnly)\s*[\("']([^"']+)[\("']`)
-
-func parseGradleBuild(content string) []Software {
-	var pkgs []Software
-	for _, match := range gradleDepRe.FindAllStringSubmatch(content, -1) {
-		dep := match[1]
-		parts := strings.Split(dep, ":")
-		switch len(parts) {
-		case 3:
-			pkgs = append(pkgs, Software{Name: parts[0] + ":" + parts[1], Version: parts[2]})
-		case 2:
-			pkgs = append(pkgs, Software{Name: parts[0], Version: parts[1]})
-		}
-	}
-	return pkgs
-}
-
-// ── Ruby ─────────────────────────────────────────────────────────────────────
-
-// gemRe matches lines like:
-//
-//	gem 'rails', '~> 7.0'
-//	gem "devise", ">= 4.0"
-//	gem 'puma'
-var gemRe = regexp.MustCompile(`^\s*gem\s+['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?`)
-
-func extractRubyPackages(dir string) []Software {
-	data, err := os.ReadFile(filepath.Join(dir, "Gemfile"))
-	if err != nil {
-		return nil
-	}
-	return parseGemfile(string(data))
-}
-
-func parseGemfile(content string) []Software {
-	var pkgs []Software
-	sc := bufio.NewScanner(strings.NewReader(content))
-	for sc.Scan() {
-		line := sc.Text()
-		if m := gemRe.FindStringSubmatch(line); m != nil {
-			pkgs = append(pkgs, Software{Name: m[1], Version: m[2]})
-		}
-	}
-	return pkgs
-}
-
-// ── .NET ─────────────────────────────────────────────────────────────────────
-
-func extractDotnetPackages(dir string) []Software {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	for _, e := range entries {
-		n := e.Name()
-		if strings.HasSuffix(n, ".csproj") ||
-			strings.HasSuffix(n, ".vbproj") ||
-			strings.HasSuffix(n, ".fsproj") {
-			data, err := os.ReadFile(filepath.Join(dir, n))
-			if err != nil {
-				continue
-			}
-			return parseDotnetProjectFile(string(data))
-		}
-	}
-	return nil
-}
-
-func parseDotnetProjectFile(content string) []Software {
-	var pkgs []Software
-	sc := bufio.NewScanner(strings.NewReader(content))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if !strings.Contains(line, "PackageReference") {
-			continue
-		}
-		name := extractXmlAttr(line, "Include")
-		version := extractXmlAttr(line, "Version")
-		if name != "" {
-			pkgs = append(pkgs, Software{Name: name, Version: version})
-		}
-	}
-	return pkgs
-}
-
-// ── XML helpers ──────────────────────────────────────────────────────────────
-
-// extractXmlValue extracts a simple tag value: <tag>value</tag>
-func extractXmlValue(line, tag string) string {
-	open := "<" + tag + ">"
-	close := "</" + tag + ">"
-	s := strings.Index(line, open)
-	e := strings.Index(line, close)
-	if s >= 0 && e > s {
-		return line[s+len(open) : e]
-	}
-	return ""
-}
-
-// extractXmlAttr extracts an XML attribute value: attr="value"
-func extractXmlAttr(line, attr string) string {
-	needle := attr + `="`
-	s := strings.Index(line, needle)
-	if s < 0 {
-		return ""
-	}
-	s += len(needle)
-	e := strings.Index(line[s:], `"`)
-	if e < 0 {
-		return ""
-	}
-	return line[s : s+e]
-}
-
-
 // ── Public API ───────────────────────────────────────────────────────────────
 
 // goModCacheDir returns the OS-appropriate Go module cache path fragment
@@ -1279,13 +895,7 @@ func goModCacheDir() string {
 	return filepath.Join(gopath, "pkg", "mod")
 }
 
-//func ListCodeScannerProjects() []ProjectInfo {
-//	log.Printf("[WARNING] Codescanner not implemented on windows yet.")
-//
-//	return []ProjectInfo{}
-//}
-
-func ListCodeScannerProjects() []ProjectInfo {
+func ListCodeScannerProjects() []shuffle.ProjectInfo {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting home directory: %v\n", err)
@@ -1300,7 +910,7 @@ func ListCodeScannerProjects() []ProjectInfo {
 		log.Printf("[ERROR] Problem in codescanner: %v\n", err)
 	}
 
-	var out []ProjectInfo
+	var out []shuffle.ProjectInfo
 	for _, p := range projects {
 		if p.Path == "" || len(p.Packages) == 0 {
 			continue
@@ -1317,7 +927,7 @@ func ListCodeScannerProjects() []ProjectInfo {
  
 // GetDisplaySizeWindows returns the dimensions of every active display.
 // Prefer calling Screenshot() if you need both image and size — it is cheaper.
-func GetDisplaySizeWindows() ([]DisplaySize, error) {
+func GetDisplaySizeWindows() ([]shuffle.DisplaySize, error) {
 	if err := checkInteractiveSession(); err != nil {
 		return nil, err
 	}
@@ -1345,9 +955,9 @@ Add-Type -AssemblyName System.Windows.Forms
 		return nil, fmt.Errorf("parsing display sizes: %w", err)
 	}
  
-	sizes := make([]DisplaySize, len(records))
+	sizes := make([]shuffle.DisplaySize, len(records))
 	for i, r := range records {
-		sizes[i] = DisplaySize{DisplayID: i + 1, Width: r.Width, Height: r.Height}
+		sizes[i] = shuffle.DisplaySize{DisplayID: i + 1, Width: r.Width, Height: r.Height}
 	}
 	return sizes, nil
 }
@@ -1355,9 +965,9 @@ Add-Type -AssemblyName System.Windows.Forms
 // GetCursorPositionWindows returns the current cursor position.
 // Origin (0,0) is the top-left of the primary display.
 // Prefer calling Screenshot() if you need both image and cursor — it is cheaper.
-func GetCursorPositionWindows() (Position, error) {
+func GetCursorPositionWindows() (shuffle.Position, error) {
 	if err := checkInteractiveSession(); err != nil {
-		return Position{}, err
+		return shuffle.Position{}, err
 	}
  
 	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", `
@@ -1365,14 +975,14 @@ Add-Type -AssemblyName System.Windows.Forms
 $p = [System.Windows.Forms.Cursor]::Position
 Write-Output "$($p.X) $($p.Y)"`).Output()
 	if err != nil {
-		return Position{}, fmt.Errorf("querying cursor position: %w", err)
+		return shuffle.Position{}, fmt.Errorf("querying cursor position: %w", err)
 	}
  
 	var x, y float64
 	if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%f %f", &x, &y); err != nil {
-		return Position{}, fmt.Errorf("parsing cursor position %q: %w", out, err)
+		return shuffle.Position{}, fmt.Errorf("parsing cursor position %q: %w", out, err)
 	}
-	return Position{X: x, Y: y}, nil
+	return shuffle.Position{X: x, Y: y}, nil
 }
  
 // checkInteractiveSession returns an error if the process is running in
@@ -1424,7 +1034,7 @@ const (
 // RemoteControl methods
 // ========================
 
-func remoteControlBatch(batch RemoteControlActionBatch) error {
+func remoteControlBatch(batch shuffle.RemoteControlActionBatch) error {
 	for _, a := range batch.Actions {
 		remoteControlExecute(a)
 	}
@@ -1432,7 +1042,7 @@ func remoteControlBatch(batch RemoteControlActionBatch) error {
 	return nil
 }
 
-func remoteControlExecute(a RemoteControl) {
+func remoteControlExecute(a shuffle.RemoteControl) {
 	switch a.Op {
 
 	// -------- Mouse --------
@@ -1517,7 +1127,7 @@ func keyPress(vk uint16) {
 	procKeybdEvent.Call(uintptr(vk), 0, 2, 0)
 }
 
-func Screenshot() ([]ScreenshotWrapper, error) {
+func Screenshot() ([]shuffle.ScreenshotWrapper, error) {
 	if err := checkInteractiveSession(); err != nil {
 		return nil, err
 	}
@@ -1595,17 +1205,18 @@ $results | ConvertTo-Json -Compress
 		return nil, fmt.Errorf("parsing screenshot metadata: %w", err)
 	}
  
-	wrappers := make([]ScreenshotWrapper, 0, len(records))
+	wrappers := make([]shuffle.ScreenshotWrapper, 0, len(records))
 	for i, r := range records {
 		data, err := os.ReadFile(r.Path)
 		os.Remove(r.Path) // clean up regardless of read outcome
 		if err != nil {
 			return nil, fmt.Errorf("reading screenshot for display %d: %w", i, err)
 		}
-		wrappers = append(wrappers, ScreenshotWrapper{
+
+		wrappers = append(wrappers, shuffle.ScreenshotWrapper{
 			Image:      data,
-			ScreenSize: DisplaySize{DisplayID: i + 1, Width: r.Width, Height: r.Height},
-			Cursor:     Position{X: r.CursorX, Y: r.CursorY},
+			ScreenSize: shuffle.DisplaySize{DisplayID: i + 1, Width: r.Width, Height: r.Height},
+			Cursor:     shuffle.Position{X: r.CursorX, Y: r.CursorY},
 		})
 	}
 	return wrappers, nil

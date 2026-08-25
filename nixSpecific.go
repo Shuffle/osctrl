@@ -8,20 +8,21 @@ import (
 	"strings"
 	"strconv"
 	"regexp"
-	"encoding/json"
 	"time"
-	"context"
-	"bytes"
-	"io"
 	"fmt"
 	"log"
 	"bufio"
 	"path/filepath"
 	"errors"
-
-	"syscall"
 	"runtime"
+
 	"github.com/shuffle/shuffle-shared"
+)
+
+const (
+	nftConf       = "/etc/nftables.conf"
+	nftBackup     = "/etc/nftables.conf.backup_edr"
+	isolationFile = "/etc/nftables.edr.conf"
 )
 
 func getAutoLockTimeout() int {
@@ -115,24 +116,7 @@ func getScreenPolicyUnix() bool {
 }
 
 func IsAutomaticScreenlockEnabled() bool { 
-	switch runtime.GOOS {
-	case "windows":
-		return false
-	case "darwin":
-		return willLockWithin15MinMac()
-	default: // linux, macOS, etc.
-		return getScreenPolicyUnix()
-	}
-}
-
-func isEncryptedMac() bool {
-	out, err := exec.Command("fdesetup", "status").Output()
-	if err != nil {
-		return false
-	}
-
-	s := strings.ToLower(string(out))
-	return strings.Contains(s, "filevault is on")
+	return getScreenPolicyUnix()
 }
 
 func isEncryptedLinux() bool {
@@ -148,14 +132,7 @@ func isEncryptedLinux() bool {
 }
 
 func IsDiskEncrypted() bool {
-	switch runtime.GOOS {
-	case "windows":
-		return false
-	case "darwin":
-		return false
-	default:
-		return isEncryptedLinux()
-	}
+	return isEncryptedLinux()
 }
 
 func cleanSerial(s string) string {
@@ -190,14 +167,7 @@ func getSerialLinux() string {
 }
 
 func GetProfiler() string {
-	switch runtime.GOOS {
-	case "windows":
-		return ""
-	case "darwin":
-		return getProfileMac()
-	default:
-		return getSerialLinux()
-	}
+	return getSerialLinux()
 }
 
 func listRPM() []shuffle.Software {
@@ -539,23 +509,15 @@ func unisolateHostLinux() error {
 }
 
 func isolateHost(allowIPs []string) error {
-	if runtime.GOOS == "darwin" {
-		return isolateHostMacos(allowIPs)
-	} else {
-		return isolateHostLinux(allowIPs)
-	}
-
-	return errors.New(fmt.Sprintf("isolation not supported on this platform"))
+	return isolateHostLinux(allowIPs)
 }
 
 func unisolateHost() error {
-	if runtime.GOOS == "darwin" {
-		return unisolateHostMacos()
-	} else {
-		return unisolateHostLinux()
-	}
+	return unisolateHostLinux()
+}
 
-	return errors.New(fmt.Sprintf("un-isolation not supported on this platform"))
+func remoteControlBatch(batch shuffle.RemoteControlActionBatch) error {
+	return errors.New(fmt.Sprintf("remote control not implemented for %s", runtime.GOOS))
 }
 
 // fileExists checks if a file exists
@@ -565,18 +527,7 @@ func checkFileExists(path string) bool {
 }
 
 func Screenshot() ([]shuffle.ScreenshotWrapper, error) {
-	if runtime.GOOS == "darwin" {
-		return ScreenshotMacos()
-	} else if runtime.GOOS == "linux" {
-		allScreens, err := ScreenshotLinux()
-		if err == nil && len(allScreens) > 0 {
-			return allScreens, nil
-		} else {
-			return nil, errors.New(fmt.Sprintf("failed to capture screenshot on Linux: %w", err))
-		}
-	} else {
-		return nil, errors.New(fmt.Sprintf(fmt.Sprintf("screenshot not supported on %s platform", runtime.GOOS)))
-	}
+	return ScreenshotLinux()
 }
 
 // runCapture runs a capture command and reads back the output file.

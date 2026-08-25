@@ -27,6 +27,8 @@ import (
 	"github.com/shuffle/shuffle-shared"
 )
 
+var debug bool = os.Getenv("DEBUG") == "1"
+
 type MacApp struct {
 	Name          string `json:"_name"`
 	Version       string `json:"version"`

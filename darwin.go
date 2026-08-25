@@ -367,8 +367,6 @@ static CElement get_element_at(int idx) {
 import "C" 
 
 
-var debug bool = os.Getenv("DEBUG") == "1"
-
 func typeText(text string) {
 	utf16Runes := utf16.Encode([]rune(text))
 	if len(utf16Runes) == 0 {
@@ -457,10 +455,6 @@ const (
 	anchorFile   = "/etc/pf.anchors/edr_isolation"
 	pfConf       = "/etc/pf.conf"
 	pfConfBackup = "/etc/pf.conf.backup_edr"
-
-	nftConf       = "/etc/nftables.conf"
-	nftBackup     = "/etc/nftables.conf.backup_edr"
-	isolationFile = "/etc/nftables.edr.conf"
 )
 
 func isolateHostMacos(allowIPs []string) error {

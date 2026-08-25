@@ -3,9 +3,12 @@ module osctrl
 go 1.25.6
 
 require (
+	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/shuffle/shuffle-shared v1.2.87
 	golang.org/x/sys v0.47.0
 )
+
+replace github.com/shuffle/shuffle-shared => ../shuffle-shared
 
 require (
 	cel.dev/expr v0.25.2 // indirect
@@ -90,6 +93,7 @@ require (
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/kevinburke/ssh_config v1.2.0 // indirect
+	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/microcosm-cc/bluemonday v1.0.27 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
@@ -112,7 +116,6 @@ require (
 	github.com/sendgrid/rest v2.6.9+incompatible // indirect
 	github.com/sendgrid/sendgrid-go v3.16.1+incompatible // indirect
 	github.com/sergi/go-diff v1.3.2-0.20230802210424-5b0b94c5c0d3 // indirect
-	github.com/shirou/gopsutil/v3 v3.24.5 // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/shuffle/opensearch-go/v4 v4.0.0 // indirect
 	github.com/skeema/knownhosts v1.3.1 // indirect
