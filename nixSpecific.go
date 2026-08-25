@@ -14,7 +14,6 @@ import (
 	"bufio"
 	"path/filepath"
 	"errors"
-	"runtime"
 
 	"github.com/shuffle/shuffle-shared"
 )
@@ -517,7 +516,194 @@ func unisolateHost() error {
 }
 
 func remoteControlBatch(batch shuffle.RemoteControlActionBatch) error {
-	return errors.New(fmt.Sprintf("remote control not implemented for %s", runtime.GOOS))
+	for _, a := range batch.Actions {
+		if err := remoteControlExecute(a); err != nil {
+			log.Printf("[WARNING] remoteControlExecute failed for action %s: %v", a.Op, err)
+		}
+	}
+	return nil
+}
+
+func remoteControlExecute(a shuffle.RemoteControl) error {
+	switch a.Op {
+	// -------- Mouse --------
+	case "mouse.move":
+		x := getInt(a.Params, "x")
+		y := getInt(a.Params, "y")
+		return exec.Command("xdotool", "mousemove", "--", fmt.Sprintf("%d", x), fmt.Sprintf("%d", y)).Run()
+
+	case "mouse.click":
+		x := getInt(a.Params, "x")
+		y := getInt(a.Params, "y")
+		button := getString(a.Params, "button")
+		delay := getInt(a.Params, "delay_ms")
+
+		btn := "1"
+		if button == "right" {
+			btn = "3"
+		} else if button == "middle" {
+			btn = "2"
+		}
+
+		if delay > 0 {
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+		}
+
+		return exec.Command("xdotool", "mousemove", "--", fmt.Sprintf("%d", x), fmt.Sprintf("%d", y), "click", btn).Run()
+
+	case "mouse.drag":
+		fx := getInt(a.Params, "from_x")
+		fy := getInt(a.Params, "from_y")
+		tx := getInt(a.Params, "to_x")
+		ty := getInt(a.Params, "to_y")
+		button := getString(a.Params, "button")
+
+		btn := "1"
+		if button == "right" {
+			btn = "3"
+		}
+
+		_ = exec.Command("xdotool", "mousemove", "--", fmt.Sprintf("%d", fx), fmt.Sprintf("%d", fy)).Run()
+		time.Sleep(50 * time.Millisecond)
+		_ = exec.Command("xdotool", "mousedown", btn).Run()
+		time.Sleep(50 * time.Millisecond)
+		_ = exec.Command("xdotool", "mousemove", "--", fmt.Sprintf("%d", tx), fmt.Sprintf("%d", ty)).Run()
+		time.Sleep(50 * time.Millisecond)
+		return exec.Command("xdotool", "mouseup", btn).Run()
+
+	// -------- Keyboard --------
+	case "keyboard.press":
+		keyStr := ""
+		if kName := getString(a.Params, "key_name"); kName != "" {
+			keyStr = kName
+		} else if kStr := getString(a.Params, "key"); kStr != "" {
+			keyStr = kStr
+		} else if keyInt := getInt(a.Params, "key"); keyInt != 0 {
+			keyStr = fmt.Sprintf("%d", keyInt)
+		}
+		if keyStr != "" {
+			return exec.Command("xdotool", "key", "--", keyStr).Run()
+		}
+
+	case "keyboard.type":
+		text := extractString(a.Params["text"])
+		if text == "" {
+			text = getString(a.Params, "text")
+		}
+		if text != "" {
+			return exec.Command("xdotool", "type", "--", text).Run()
+		}
+
+	case "keyboard.hotkey":
+		keySlice := parseHotkeyParams(a.Params["keys"])
+		if len(keySlice) == 0 {
+			keySlice = extractStringSlice(a.Params["keys"])
+		}
+		if len(keySlice) == 0 {
+			keySlice = parseHotkeyParams(a.Params["key"])
+		}
+		if len(keySlice) > 0 {
+			combo := strings.Join(keySlice, "+")
+			return exec.Command("xdotool", "key", "--", combo).Run()
+		}
+
+	// -------- Utility --------
+	case "system.wait":
+		ms := getInt(a.Params, "ms")
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+	return nil
+}
+
+// FetchFocusedElement queries the currently active/focused window on Linux (X11)
+// and returns its bounding box, title, and application name.
+func FetchFocusedElement(displayNum int, maxDepth int) ([]shuffle.UIElement, error) {
+	if os.Getenv("DISPLAY") == "" {
+		return nil, nil
+	}
+
+	out, err := exec.Command("xdotool", "getactivewindow").Output()
+	if err != nil {
+		return nil, nil
+	}
+	winID := strings.TrimSpace(string(out))
+	if winID == "" {
+		return nil, nil
+	}
+
+	infoOut, err := exec.Command("xwininfo", "-id", winID).Output()
+	if err != nil {
+		return nil, nil
+	}
+
+	var x, y, width, height float64
+	var title string
+	lines := strings.Split(string(infoOut), "\n")
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "xwininfo: Window id: ") {
+			if idx := strings.Index(l, "\""); idx != -1 {
+				lastIdx := strings.LastIndex(l, "\"")
+				if lastIdx > idx {
+					title = l[idx+1 : lastIdx]
+				}
+			}
+		}
+		if strings.HasPrefix(l, "Absolute upper-left X:") {
+			parts := strings.Split(l, ":")
+			if len(parts) >= 2 {
+				fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &x)
+			}
+		}
+		if strings.HasPrefix(l, "Absolute upper-left Y:") {
+			parts := strings.Split(l, ":")
+			if len(parts) >= 2 {
+				fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &y)
+			}
+		}
+		if strings.HasPrefix(l, "Width:") {
+			parts := strings.Split(l, ":")
+			if len(parts) >= 2 {
+				fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &width)
+			}
+		}
+		if strings.HasPrefix(l, "Height:") {
+			parts := strings.Split(l, ":")
+			if len(parts) >= 2 {
+				fmt.Sscanf(strings.TrimSpace(parts[1]), "%f", &height)
+			}
+		}
+	}
+
+	appName := "Window"
+	propOut, err := exec.Command("xprop", "-id", winID, "WM_CLASS").Output()
+	if err == nil {
+		propStr := string(propOut)
+		if parts := strings.Split(propStr, "="); len(parts) >= 2 {
+			classes := strings.Split(parts[1], ",")
+			if len(classes) > 0 {
+				appName = strings.Trim(strings.TrimSpace(classes[len(classes)-1]), "\"")
+			}
+		}
+	}
+
+	elem := shuffle.UIElement{
+		AppName: appName,
+		Role:    "Window",
+		Label:   title,
+		ClickPoint: shuffle.Point{
+			X: x + (width / 2.0),
+			Y: y + (height / 2.0),
+		},
+		Rect: shuffle.Rect{
+			X:      x,
+			Y:      y,
+			Width:  width,
+			Height: height,
+		},
+	}
+
+	return []shuffle.UIElement{elem}, nil
 }
 
 // fileExists checks if a file exists
@@ -593,10 +779,17 @@ func screenshotX11() ([]shuffle.ScreenshotWrapper, error) {
 			}
 			png = data
 		}
+
+		elementTree, err := FetchFocusedElement(d.DisplayID, 10)
+		if err != nil {
+			log.Printf("[ERROR] Focused tree problem for screen %d: %v", d.DisplayID, err)
+		}
+
 		wrappers = append(wrappers, shuffle.ScreenshotWrapper{
-			Image:      png,
-			ScreenSize: d,
-			Cursor:     cursor,
+			Image:       png,
+			ScreenSize:  d,
+			Cursor:      cursor,
+			ElementTree: elementTree,
 		})
 	}
 	return wrappers, nil
@@ -743,10 +936,16 @@ func screenshotWlroots() ([]shuffle.ScreenshotWrapper, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading screenshot for output %q: %w", d.OutputName, err)
 		}
+		elementTree, err := FetchFocusedElement(d.DisplayID, 10)
+		if err != nil {
+			log.Printf("[ERROR] Focused tree problem for screen %d: %v", d.DisplayID, err)
+		}
+
 		wrappers = append(wrappers, shuffle.ScreenshotWrapper{
-			Image:      data,
-			ScreenSize: d.DisplaySize,
-			Cursor:     shuffle.Position{}, // not available on Wayland
+			Image:       data,
+			ScreenSize:  d.DisplaySize,
+			Cursor:      shuffle.Position{}, // not available on Wayland
+			ElementTree: elementTree,
 		})
 	}
 	return wrappers, nil
@@ -778,15 +977,21 @@ func screenshotGnomeWayland() ([]shuffle.ScreenshotWrapper, error) {
 		sizes = []shuffle.DisplaySize{{DisplayID: 1}}
 	}
 
+	elementTree, err := FetchFocusedElement(1, 10)
+	if err != nil {
+		log.Printf("[ERROR] Focused tree problem for Wayland display: %v", err)
+	}
+
 	// We have one combined image but potentially multiple display size entries.
 	// Return one wrapper per display with the same combined image — the caller
 	// can use ScreenSize to understand the logical layout.
 	wrappers := make([]shuffle.ScreenshotWrapper, len(sizes))
 	for i, s := range sizes {
 		wrappers[i] = shuffle.ScreenshotWrapper{
-			Image:      data,
-			ScreenSize: s,
-			Cursor:     shuffle.Position{},
+			Image:       data,
+			ScreenSize:  s,
+			Cursor:      shuffle.Position{},
+			ElementTree: elementTree,
 		}
 	}
 	return wrappers, nil

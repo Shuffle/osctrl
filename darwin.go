@@ -375,52 +375,6 @@ func typeText(text string) {
 	C.NativeTypeText((*C.UniChar)(&utf16Runes[0]), C.size_t(len(utf16Runes)))
 }
 
-// Helper: Safely converts string or []interface{} into a single string
-func extractString(param interface{}) string {
-	switch v := param.(type) {
-	case string:
-		return v
-	case []interface{}:
-		var parts []string
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				parts = append(parts, s)
-			}
-		}
-		return strings.Join(parts, " ")
-	}
-	return ""
-}
-
-// Helper: Safely extracts key slices from "cmd,t", ["cmd", "t"], or "Enter"
-func extractStringSlice(param interface{}) []string {
-	switch v := param.(type) {
-	case string:
-		if strings.Contains(v, ",") {
-			rawParts := strings.Split(v, ",")
-			var result []string
-			for _, p := range rawParts {
-				trimmed := strings.TrimSpace(p)
-				if trimmed != "" {
-					result = append(result, trimmed)
-				}
-			}
-			return result
-		}
-		return []string{strings.TrimSpace(v)}
-
-	case []interface{}:
-		var result []string
-		for _, item := range v {
-			if s, ok := item.(string); ok {
-				result = append(result, strings.TrimSpace(s))
-			}
-		}
-		return result
-	}
-	return nil
-}
-
 // GetCursorPositionMacos returns the current cursor position in global screen
 // coordinates using native macOS CoreGraphics. The origin (0,0) is the top-left of the
 // primary display; coordinates increase right and down.
@@ -948,32 +902,6 @@ func IsDiskEncrypted() bool {
 	}
 
 	return result
-}
-
-func parseHotkeyParams(param interface{}) []string {
-	switch v := param.(type) {
-
-	// Single key string passed: "Enter" or "Tab"
-	case string:
-		return []string{v}
-
-	// Array of key strings passed: ["Control", "Tab"]
-	case []interface{}:
-		keys := make([]string, 0, len(v))
-		for _, item := range v {
-			if str, ok := item.(string); ok {
-				keys = append(keys, str)
-			}
-		}
-
-		return keys
-
-	// Array directly unmarshaled as []string
-	case []string:
-		return v
-	}
-
-	return nil
 }
 
 var macKeyNameToCode = map[string]uint16{

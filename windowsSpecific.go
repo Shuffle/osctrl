@@ -4,7 +4,6 @@ package osctrl
 
 import (
 	"strings"
-	"runtime"
 	"encoding/json"
 	"log"
 	"os"
@@ -678,253 +677,99 @@ func unisolateHost() error {
 }
 
 
-// ── Public entry point ───────────────────────────────────────────────────────
+// ========================
+// Windows API bindings
+// ========================
 
-func (s *Scanner) Scan(rootDir string) ([]shuffle.ProjectInfo, error) {
-	absRoot, err := filepath.Abs(rootDir)
-	if err != nil {
-		return nil, fmt.Errorf("invalid root directory: %w", err)
-	}
-
-	s.wg.Add(1)
-	go s.scanDir(absRoot)
-
-	var results []shuffle.ProjectInfo
-	done := make(chan struct{})
-	go func() {
-		for p := range s.results {
-			results = append(results, p)
-		}
-		close(done)
-	}()
-
-	s.wg.Wait()
-	close(s.results)
-	<-done
-
-	return results, nil
+type winRect struct {
+	Left, Top, Right, Bottom int32
 }
 
-// ── Directory walker ─────────────────────────────────────────────────────────
+var (
+	user32 = windows.NewLazySystemDLL("user32.dll")
 
-func (s *Scanner) scanDir(dir string) {
-	defer s.wg.Done()
+	procSetCursorPos             = user32.NewProc("SetCursorPos")
+	procMouseEvent               = user32.NewProc("mouse_event")
+	procKeybdEvent               = user32.NewProc("keybd_event")
+	procGetForegroundWindow      = user32.NewProc("GetForegroundWindow")
+	procGetWindowTextW           = user32.NewProc("GetWindowTextW")
+	procGetWindowRect            = user32.NewProc("GetWindowRect")
+	procGetWindowThreadProcessId = user32.NewProc("GetWindowThreadProcessId")
+)
 
-	// Resolve symlinks so we never visit the same inode twice.
-	real, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		return
+// ========================
+// Mouse constants & Flags
+// ========================
+
+const (
+	MOUSE_LEFTDOWN    = 0x0002
+	MOUSE_LEFTUP      = 0x0004
+	MOUSE_RIGHTDOWN   = 0x0008
+	MOUSE_RIGHTUP     = 0x0010
+	KEYEVENTF_KEYUP   = 0x0002
+	KEYEVENTF_UNICODE = 0x0004
+)
+
+// FetchFocusedElement fetches the currently focused / active foreground window
+// on Windows, returning its bounding box, title, and process name.
+func FetchFocusedElement(displayNum int, maxDepth int) ([]shuffle.UIElement, error) {
+	hwnd, _, _ := procGetForegroundWindow.Call()
+	if hwnd == 0 {
+		return nil, nil
 	}
 
-	s.mu.Lock()
-	if s.visited[real] {
-		s.mu.Unlock()
-		return
-	}
-	s.visited[real] = true
-	s.mu.Unlock()
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
+	var r winRect
+	ret, _, _ := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
+	if ret == 0 {
+		return nil, nil
 	}
 
-	for _, entry := range entries {
-		if shouldSkip(entry.Name()) {
-			continue
-		}
-
-		fullPath := filepath.Join(dir, entry.Name())
-
-		if !entry.IsDir() {
-			continue
-		}
-
-		if projectType := detectProjectType(fullPath); projectType != "" {
-			packages := extractPackages(fullPath, projectType)
-			s.results <- shuffle.ProjectInfo{
-				Path:     fullPath,
-				Type:     projectType,
-				Packages: packages,
-			}
-			// Do not recurse into found projects — avoids duplicates.
-			continue
-		}
-
-		s.wg.Add(1)
-		go s.scanDir(fullPath)
+	buf := make([]uint16, 512)
+	lenRet, _, _ := procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 512)
+	title := ""
+	if lenRet > 0 {
+		title = windows.UTF16ToString(buf[:lenRet])
 	}
-}
 
-// ── Skip list ────────────────────────────────────────────────────────────────
+	var pid uint32
+	procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&pid)))
 
-// skipDirs is the unified skip list for all platforms.
-// Windows-specific entries are appended at init time.
-var skipDirs = map[string]bool{
-	// VCS
-	".git": true,
-	".hg":  true,
-	".svn": true,
-
-	// Dependency caches
-	"node_modules": true,
-	"vendor":       true,
-	".venv":        true,
-	"venv":         true,
-	".env":         true,
-
-	// IDE / tooling
-	".vscode": true,
-	".idea":   true,
-
-	// Build output
-	"dist":   true,
-	"build":  true,
-	"target": true,
-	"out":    true,
-	"bin":    true,
-	"obj":    true, // .NET
-
-	// Caches
-	".cache":    true,
-	"__pycache__": true,
-}
-
-func init() {
-	if runtime.GOOS == "windows" {
-		// Windows system and user-profile noise — these directories sit under
-		// %USERPROFILE% but contain no user code.
-		for _, d := range []string{
-			"AppData",
-			"Application Data",
-			"Local Settings",
-			"MicrosoftEdgeBackups",
-			"OneDrive",         // mirror of cloud files, not local projects
-			"Windows",
-			"Program Files",
-			"Program Files (x86)",
-			"ProgramData",
-			"$Recycle.Bin",
-			"System Volume Information",
-			"Recovery",
-		} {
-			skipDirs[d] = true
-		}
-	}
-}
-
-func shouldSkip(name string) bool {
-	if skipDirs[name] {
-		return true
-	}
-	// Hidden directories (dot-prefixed) on Unix; also catches .git etc. on Windows.
-	if strings.HasPrefix(name, ".") && name != "." {
-		return true
-	}
-	return false
-}
-
-// ── Project detection ────────────────────────────────────────────────────────
-
-func detectProjectType(dir string) string {
-	if shuffle.FileExists(filepath.Join(dir, "go.mod")) {
-		return "golang"
-	}
-	if shuffle.FileExists(filepath.Join(dir, "pyproject.toml")) ||
-		shuffle.FileExists(filepath.Join(dir, "requirements.txt")) ||
-		shuffle.FileExists(filepath.Join(dir, "Pipfile")) {
-		return "python"
-	}
-	if shuffle.FileExists(filepath.Join(dir, "package.json")) {
-		return "javascript"
-	}
-	if shuffle.FileExists(filepath.Join(dir, "pom.xml")) ||
-		shuffle.FileExists(filepath.Join(dir, "build.gradle")) ||
-		shuffle.FileExists(filepath.Join(dir, "build.gradle.kts")) {
-		return "java"
-	}
-	if shuffle.FileExists(filepath.Join(dir, "Gemfile")) ||
-		shuffle.FileExists(filepath.Join(dir, "Rakefile")) {
-		return "ruby"
-	}
-	// .NET: must ReadDir — glob patterns are not valid os.Stat paths.
-	if entries, err := os.ReadDir(dir); err == nil {
-		for _, e := range entries {
-			n := e.Name()
-			if strings.HasSuffix(n, ".csproj") ||
-				strings.HasSuffix(n, ".vbproj") ||
-				strings.HasSuffix(n, ".fsproj") {
-				return "dotnet"
+	appName := "Unknown"
+	if pid > 0 {
+		if hProcess, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid); err == nil {
+			defer windows.CloseHandle(hProcess)
+			nameBuf := make([]uint16, 1024)
+			nSize := uint32(len(nameBuf))
+			if err := windows.QueryFullProcessImageName(hProcess, 0, &nameBuf[0], &nSize); err == nil {
+				appName = filepath.Base(windows.UTF16ToString(nameBuf[:nSize]))
 			}
 		}
 	}
-	return ""
+
+	w := float64(r.Right - r.Left)
+	h := float64(r.Bottom - r.Top)
+	x := float64(r.Left)
+	y := float64(r.Top)
+
+	elem := shuffle.UIElement{
+		AppName: appName,
+		Role:    "Window",
+		Label:   title,
+		ClickPoint: shuffle.Point{
+			X: x + (w / 2.0),
+			Y: y + (h / 2.0),
+		},
+		Rect: shuffle.Rect{
+			X:      x,
+			Y:      y,
+			Width:  w,
+			Height: h,
+		},
+	}
+
+	return []shuffle.UIElement{elem}, nil
 }
 
-// ── Dispatcher ───────────────────────────────────────────────────────────────
-
-func extractPackages(dir, projectType string) []shuffle.Software {
-	switch projectType {
-	case "golang":
-		return extractGoPackages(dir)
-	case "python":
-		return extractPythonPackages(dir)
-	case "javascript":
-		return extractJavaScriptPackages(dir)
-	case "java":
-		return extractJavaPackages(dir)
-	case "ruby":
-		return extractRubyPackages(dir)
-	case "dotnet":
-		return extractDotnetPackages(dir)
-	}
-	return nil
-}
-
-// ── Public API ───────────────────────────────────────────────────────────────
-
-// goModCacheDir returns the OS-appropriate Go module cache path fragment
-// so we can filter it regardless of platform.
-func goModCacheDir() string {
-	// GOPATH may be set explicitly; fall back to the default ~/go.
-	gopath := os.Getenv("GOPATH")
-	if gopath == "" {
-		home, _ := os.UserHomeDir()
-		gopath = filepath.Join(home, "go")
-	}
-	return filepath.Join(gopath, "pkg", "mod")
-}
-
-func ListCodeScannerProjects() []shuffle.ProjectInfo {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting home directory: %v\n", err)
-		return nil
-	}
-
-	modCache := goModCacheDir()
-
-	sc := NewScanner()
-	projects, err := sc.Scan(homeDir)
-	if err != nil {
-		log.Printf("[ERROR] Problem in codescanner: %v\n", err)
-	}
-
-	var out []shuffle.ProjectInfo
-	for _, p := range projects {
-		if p.Path == "" || len(p.Packages) == 0 {
-			continue
-		}
-		// Skip the Go module download cache — these are vendored copies,
-		// not the user's own projects.
-		if strings.HasPrefix(p.Path, modCache) {
-			continue
-		}
-		out = append(out, p)
-	}
-	return out
-}
- 
 // GetDisplaySizeWindows returns the dimensions of every active display.
 // Prefer calling Screenshot() if you need both image and size — it is cheaper.
 func GetDisplaySizeWindows() ([]shuffle.DisplaySize, error) {
@@ -1008,29 +853,6 @@ func checkInteractiveSession() error {
 }
 
 // ========================
-// Windows API bindings
-// ========================
-
-var (
-	user32           = windows.NewLazySystemDLL("user32.dll")
-
-	procSetCursorPos = user32.NewProc("SetCursorPos")
-	procMouseEvent   = user32.NewProc("mouse_event")
-	procKeybdEvent   = user32.NewProc("keybd_event")
-)
-
-// ========================
-// Mouse constants
-// ========================
-
-const (
-	MOUSE_LEFTDOWN  = 0x0002
-	MOUSE_LEFTUP    = 0x0004
-	MOUSE_RIGHTDOWN = 0x0008
-	MOUSE_RIGHTUP   = 0x0010
-)
-
-// ========================
 // RemoteControl methods
 // ========================
 
@@ -1059,7 +881,9 @@ func remoteControlExecute(a shuffle.RemoteControl) {
 		delay := getInt(a.Params, "delay_ms")
 
 		setCursor(x, y)
-		time.Sleep(time.Duration(delay) * time.Millisecond)
+		if delay > 0 {
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+		}
 
 		mouseDown(button)
 		time.Sleep(50 * time.Millisecond)
@@ -1086,8 +910,66 @@ func remoteControlExecute(a shuffle.RemoteControl) {
 	// -------- Keyboard --------
 
 	case "keyboard.press":
-		key := getInt(a.Params, "key")
-		keyPress(uint16(key))
+		vk := uint16(getInt(a.Params, "key"))
+		if vk == 0 {
+			if kName := getString(a.Params, "key_name"); kName != "" {
+				if code, ok := keyNameToVK[strings.ToLower(kName)]; ok {
+					vk = code
+				}
+			}
+		}
+		if vk == 0 {
+			if kStr := getString(a.Params, "key"); kStr != "" {
+				if code, ok := keyNameToVK[strings.ToLower(kStr)]; ok {
+					vk = code
+				}
+			}
+		}
+		if vk != 0 {
+			keyPress(vk)
+		}
+
+	case "keyboard.type":
+		text := extractString(a.Params["text"])
+		if text == "" {
+			text = getString(a.Params, "text")
+		}
+		if text != "" {
+			for _, r := range text {
+				procKeybdEvent.Call(0, uintptr(r), KEYEVENTF_UNICODE, 0)
+				time.Sleep(5 * time.Millisecond)
+				procKeybdEvent.Call(0, uintptr(r), KEYEVENTF_UNICODE|KEYEVENTF_KEYUP, 0)
+				time.Sleep(15 * time.Millisecond)
+			}
+		}
+
+	case "keyboard.hotkey":
+		keySlice := parseHotkeyParams(a.Params["keys"])
+		if len(keySlice) == 0 {
+			keySlice = extractStringSlice(a.Params["keys"])
+		}
+		if len(keySlice) == 0 {
+			keySlice = parseHotkeyParams(a.Params["key"])
+		}
+
+		var vks []uint16
+		for _, k := range keySlice {
+			if code, ok := keyNameToVK[strings.ToLower(strings.TrimSpace(k))]; ok {
+				vks = append(vks, code)
+			}
+		}
+
+		if len(vks) > 0 {
+			for _, vk := range vks {
+				procKeybdEvent.Call(uintptr(vk), 0, 0, 0)
+				time.Sleep(15 * time.Millisecond)
+			}
+			time.Sleep(30 * time.Millisecond)
+			for i := len(vks) - 1; i >= 0; i-- {
+				procKeybdEvent.Call(uintptr(vks[i]), 0, KEYEVENTF_KEYUP, 0)
+				time.Sleep(15 * time.Millisecond)
+			}
+		}
 
 	// -------- Utility --------
 
@@ -1124,7 +1006,7 @@ func mouseUp(button string) {
 func keyPress(vk uint16) {
 	procKeybdEvent.Call(uintptr(vk), 0, 0, 0)
 	time.Sleep(30 * time.Millisecond)
-	procKeybdEvent.Call(uintptr(vk), 0, 2, 0)
+	procKeybdEvent.Call(uintptr(vk), 0, KEYEVENTF_KEYUP, 0)
 }
 
 func Screenshot() ([]shuffle.ScreenshotWrapper, error) {
@@ -1213,11 +1095,19 @@ $results | ConvertTo-Json -Compress
 			return nil, fmt.Errorf("reading screenshot for display %d: %w", i, err)
 		}
 
-		wrappers = append(wrappers, shuffle.ScreenshotWrapper{
-			Image:      data,
-			ScreenSize: shuffle.DisplaySize{DisplayID: i + 1, Width: r.Width, Height: r.Height},
-			Cursor:     shuffle.Position{X: r.CursorX, Y: r.CursorY},
-		})
+		elementTree, err := FetchFocusedElement(i+1, 10)
+		if err != nil {
+			log.Printf("[ERROR] Focused tree problem for screen %d: %v", i+1, err)
+		}
+
+		screen := shuffle.ScreenshotWrapper{
+			Image:       data,
+			ScreenSize:  shuffle.DisplaySize{DisplayID: i + 1, Width: r.Width, Height: r.Height},
+			Cursor:      shuffle.Position{X: r.CursorX, Y: r.CursorY},
+			ElementTree: elementTree,
+		}
+
+		wrappers = append(wrappers, screen)
 	}
 	return wrappers, nil
 }

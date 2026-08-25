@@ -152,6 +152,38 @@ var keyNameToVK = map[string]uint16{
 	"playpause":  0xB3, // VK_MEDIA_PLAY_PAUSE
 }
 
+// skipDirs is the unified skip list for all platforms.
+// Windows-specific entries are appended at init time if running on Windows.
+var skipDirs = map[string]bool{
+	// VCS
+	".git": true,
+	".hg":  true,
+	".svn": true,
+
+	// Dependency caches
+	"node_modules": true,
+	"vendor":       true,
+	".venv":        true,
+	"venv":         true,
+	".env":         true,
+
+	// IDE / tooling
+	".vscode": true,
+	".idea":   true,
+
+	// Build output
+	"dist":   true,
+	"build":  true,
+	"target": true,
+	"out":    true,
+	"bin":    true,
+	"obj":    true, // .NET
+
+	// Caches
+	".cache":      true,
+	"__pycache__": true,
+}
+
 // Auto-populate letters, numbers, function keys, and numpad digits to avoid boilerplate
 func init() {
 	// Top Row Numbers: '0'-'9' (VK 0x30 to 0x39)
@@ -175,6 +207,25 @@ func init() {
 		keyNameToVK[fmt.Sprintf("num%d", i)] = uint16(0x60 + i)
 		keyNameToVK[fmt.Sprintf("numpad%d", i)] = uint16(0x60 + i)
 	}
+
+	if runtime.GOOS == "windows" {
+		for _, d := range []string{
+			"AppData",
+			"Application Data",
+			"Local Settings",
+			"MicrosoftEdgeBackups",
+			"OneDrive",
+			"Windows",
+			"Program Files",
+			"Program Files (x86)",
+			"ProgramData",
+			"$Recycle.Bin",
+			"System Volume Information",
+			"Recovery",
+		} {
+			skipDirs[d] = true
+		}
+	}
 }
 
 func getInt(m map[string]any, key string) int {
@@ -196,6 +247,70 @@ func getString(m map[string]any, key string) string {
 		}
 	}
 	return ""
+}
+
+// Safely converts string or []interface{} into a single string
+func extractString(param interface{}) string {
+	switch v := param.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var parts []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, " ")
+	}
+	return ""
+}
+
+// Safely extracts key slices from "cmd,t", ["cmd", "t"], or "Enter"
+func extractStringSlice(param interface{}) []string {
+	switch v := param.(type) {
+	case string:
+		if strings.Contains(v, ",") {
+			rawParts := strings.Split(v, ",")
+			var result []string
+			for _, p := range rawParts {
+				trimmed := strings.TrimSpace(p)
+				if trimmed != "" {
+					result = append(result, trimmed)
+				}
+			}
+			return result
+		}
+		return []string{strings.TrimSpace(v)}
+
+	case []interface{}:
+		var result []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				result = append(result, strings.TrimSpace(s))
+			}
+		}
+		return result
+	}
+	return nil
+}
+
+func parseHotkeyParams(param interface{}) []string {
+	switch v := param.(type) {
+	case string:
+		return []string{v}
+	case []interface{}:
+		keys := make([]string, 0, len(v))
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				keys = append(keys, str)
+			}
+		}
+		return keys
+	case []string:
+		return v
+	}
+	return nil
 }
 
 func isValidSerial(s string) bool {
@@ -1321,4 +1436,183 @@ func extractXmlValue(line string, tag string) string {
 	}
 
 	return ""
+}
+
+// ── Unified Code Scanner Engine ──────────────────────────────────────────────
+
+func (s *Scanner) Scan(rootDir string) ([]shuffle.ProjectInfo, error) {
+	absRoot, err := filepath.Abs(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("invalid root directory: %w", err)
+	}
+
+	s.wg.Add(1)
+	go s.scanDir(absRoot)
+
+	var results []shuffle.ProjectInfo
+	done := make(chan struct{})
+	go func() {
+		for p := range s.results {
+			results = append(results, p)
+		}
+		close(done)
+	}()
+
+	s.wg.Wait()
+	close(s.results)
+	<-done
+
+	return results, nil
+}
+
+func (s *Scanner) scanDir(dir string) {
+	defer s.wg.Done()
+
+	// Resolve symlinks so we never visit the same inode twice.
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return
+	}
+
+	s.mu.Lock()
+	if s.visited[real] {
+		s.mu.Unlock()
+		return
+	}
+	s.visited[real] = true
+	s.mu.Unlock()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if shouldSkip(entry.Name()) {
+			continue
+		}
+
+		fullPath := filepath.Join(dir, entry.Name())
+
+		if !entry.IsDir() {
+			continue
+		}
+
+		if projectType := detectProjectType(fullPath); projectType != "" {
+			packages := extractPackages(fullPath, projectType)
+			s.results <- shuffle.ProjectInfo{
+				Path:     fullPath,
+				Type:     projectType,
+				Packages: packages,
+			}
+			// Do not recurse into found projects — avoids duplicates.
+			continue
+		}
+
+		s.wg.Add(1)
+		go s.scanDir(fullPath)
+	}
+}
+
+func shouldSkip(name string) bool {
+	if skipDirs[name] {
+		return true
+	}
+	// Hidden directories (dot-prefixed) on Unix; also catches .git etc. on Windows.
+	if strings.HasPrefix(name, ".") && name != "." {
+		return true
+	}
+	return false
+}
+
+func detectProjectType(dir string) string {
+	if shuffle.FileExists(filepath.Join(dir, "go.mod")) {
+		return "golang"
+	}
+	if shuffle.FileExists(filepath.Join(dir, "pyproject.toml")) ||
+		shuffle.FileExists(filepath.Join(dir, "requirements.txt")) ||
+		shuffle.FileExists(filepath.Join(dir, "Pipfile")) {
+		return "python"
+	}
+	if shuffle.FileExists(filepath.Join(dir, "package.json")) {
+		return "javascript"
+	}
+	if shuffle.FileExists(filepath.Join(dir, "pom.xml")) ||
+		shuffle.FileExists(filepath.Join(dir, "build.gradle")) ||
+		shuffle.FileExists(filepath.Join(dir, "build.gradle.kts")) {
+		return "java"
+	}
+	if shuffle.FileExists(filepath.Join(dir, "Gemfile")) ||
+		shuffle.FileExists(filepath.Join(dir, "Rakefile")) {
+		return "ruby"
+	}
+	// .NET: must ReadDir — glob patterns are not valid os.Stat paths.
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			n := e.Name()
+			if strings.HasSuffix(n, ".csproj") ||
+				strings.HasSuffix(n, ".vbproj") ||
+				strings.HasSuffix(n, ".fsproj") {
+				return "dotnet"
+			}
+		}
+	}
+	return ""
+}
+
+func extractPackages(dir, projectType string) []shuffle.Software {
+	switch projectType {
+	case "golang":
+		return extractGoPackages(dir)
+	case "python":
+		return extractPythonPackages(dir)
+	case "javascript":
+		return extractJavaScriptPackages(dir)
+	case "java":
+		return extractJavaPackages(dir)
+	case "ruby":
+		return extractRubyPackages(dir)
+	case "dotnet":
+		return extractDotnetPackages(dir)
+	}
+	return nil
+}
+
+func goModCacheDir() string {
+	gopath := os.Getenv("GOPATH")
+	if gopath == "" {
+		home, _ := os.UserHomeDir()
+		gopath = filepath.Join(home, "go")
+	}
+	return filepath.Join(gopath, "pkg", "mod")
+}
+
+func ListCodeScannerProjects() []shuffle.ProjectInfo {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("[ERROR] Problem in codescanner: %v\n", err)
+		return nil
+	}
+
+	modCache := goModCacheDir()
+
+	sc := NewScanner()
+	projects, err := sc.Scan(homeDir)
+	if err != nil {
+		log.Printf("[ERROR] Problem in codescanner: %v\n", err)
+	}
+
+	var out []shuffle.ProjectInfo
+	for _, p := range projects {
+		if p.Path == "" || len(p.Packages) == 0 {
+			continue
+		}
+		// Skip the Go module download cache — these are vendored copies,
+		// not the user's own projects.
+		if strings.HasPrefix(p.Path, modCache) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
