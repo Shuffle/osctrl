@@ -15,6 +15,7 @@ import (
 
 	"os/exec"
 	"runtime"
+	"sync"
 	"bytes"
 
 	"github.com/shuffle/shuffle-shared"
@@ -29,6 +30,9 @@ import (
 #cgo LDFLAGS: -framework ApplicationServices -framework CoreFoundation
 #include <ApplicationServices/ApplicationServices.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
 static int GetNativeCursorPosition(double *x, double *y) {
     CGEventRef event = CGEventCreate(NULL);
@@ -123,111 +127,241 @@ void NativeKeyEventWithFlags(uint16_t keyCode, bool isDown, uint64_t flags) {
     if (source) CFRelease(source);
 }
 
+// Screen control below
 typedef struct {
     double x, y, w, h;
-    char role[64];
-    char label[128];
-    int error_code;
+    double click_x, click_y;
+    char app_name[96];
+    char role[48];
+    char label[96];
+    char value[96];
 } CElement;
 
-// Pure C: Find the PID of the top-most visible window
-static pid_t get_frontmost_pid_pure_c() {
+typedef struct {
+    CElement *items;
+    int count;
+    int capacity;
+} CBuffer;
+
+static CBuffer g_buf = {0};
+
+static void clear_buffer() {
+    if (g_buf.items != NULL) {
+        free(g_buf.items);
+        g_buf.items = NULL;
+    }
+    g_buf.count = 0;
+    g_buf.capacity = 0;
+}
+
+static inline void push_elem(CElement *item) {
+    if (g_buf.count >= g_buf.capacity) {
+        int new_cap = (g_buf.capacity == 0) ? 64 : g_buf.capacity * 2;
+        CElement *new_items = (CElement *)realloc(g_buf.items, new_cap * sizeof(CElement));
+        if (!new_items) return;
+        g_buf.items = new_items;
+        g_buf.capacity = new_cap;
+    }
+    g_buf.items[g_buf.count++] = *item;
+}
+
+static CGDirectDisplayID resolve_display_id(int displayNum, int *errOut) {
+    CGDirectDisplayID displays[16];
+    uint32_t count = 0;
+    if (CGGetActiveDisplayList(16, displays, &count) == kCGErrorSuccess && count > 0) {
+        if (displayNum >= 1 && displayNum <= (int)count) {
+            *errOut = 0;
+            return displays[displayNum - 1];
+        }
+    }
+    *errOut = -2; // Error: Invalid display index
+    return 0;
+}
+
+static pid_t get_top_app_for_display(CGRect targetBounds, char *appNameOut, size_t maxLen) {
     pid_t pid = 0;
     CFArrayRef windowList = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, 
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID
     );
-    
     if (!windowList) return 0;
 
     CFIndex count = CFArrayGetCount(windowList);
     for (CFIndex i = 0; i < count; i++) {
         CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(windowList, i);
-        
-        // Skip system overlays and dock (Layer 0 is standard app windows)
+
         CFNumberRef layerRef = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowLayer);
         int layer = 0;
         if (layerRef) CFNumberGetValue(layerRef, kCFNumberIntType, &layer);
         if (layer != 0) continue;
 
-        // Extract owner PID
+        CFDictionaryRef boundsDict = (CFDictionaryRef)CFDictionaryGetValue(info, kCGWindowBounds);
+        if (boundsDict) {
+            CGRect winBounds = CGRectZero;
+            CGRectMakeWithDictionaryRepresentation(boundsDict, &winBounds);
+            if (!CGRectIntersectsRect(targetBounds, winBounds)) {
+                continue;
+            }
+        }
+
         CFNumberRef pidRef = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowOwnerPID);
         if (pidRef) {
             CFNumberGetValue(pidRef, kCFNumberIntType, &pid);
-            if (pid > 0) break;
+            if (pid > 0) {
+                CFStringRef ownerName = (CFStringRef)CFDictionaryGetValue(info, kCGWindowOwnerName);
+                if (ownerName && appNameOut) {
+                    CFStringGetCString(ownerName, appNameOut, maxLen, kCFStringEncodingUTF8);
+                }
+                break;
+            }
         }
     }
-    
     CFRelease(windowList);
     return pid;
 }
 
-static CElement get_frontmost_app_ui_element() {
-    CElement out = {0};
+static void traverse_fast(AXUIElementRef elem, CGRect targetBounds, const char *appName, int depth, int maxDepth) {
+    if (!elem || depth > maxDepth) return;
 
-    if (!AXIsProcessTrusted()) {
-        out.error_code = -1; // Missing TCC permissions
-        return out;
-    }
-
-    pid_t pid = get_frontmost_pid_pure_c();
-    if (pid == 0) {
-        out.error_code = -25204;
-        return out;
-    }
-
-    AXUIElementRef appElem = AXUIElementCreateApplication(pid);
-    if (!appElem) {
-        out.error_code = -25201;
-        return out;
-    }
-
-    AXUIElementRef targetElem = NULL;
-    AXError err = AXUIElementCopyAttributeValue(appElem, kAXFocusedWindowAttribute, (CFTypeRef*)&targetElem);
-    if (err != kAXErrorSuccess || !targetElem) {
-        err = AXUIElementCopyAttributeValue(appElem, kAXMainWindowAttribute, (CFTypeRef*)&targetElem);
-    }
-    if (err != kAXErrorSuccess || !targetElem) {
-        targetElem = appElem;
-        CFRetain(targetElem);
-    }
-
-    // Extract Title / Label
-    CFTypeRef titleVal = NULL;
-    if (AXUIElementCopyAttributeValue(targetElem, kAXTitleAttribute, &titleVal) == kAXErrorSuccess && titleVal) {
-        CFStringGetCString((CFStringRef)titleVal, out.label, sizeof(out.label), kCFStringEncodingUTF8);
-        CFRelease(titleVal);
-    }
-
-    // Extract Role
-    CFTypeRef roleVal = NULL;
-    if (AXUIElementCopyAttributeValue(targetElem, kAXRoleAttribute, &roleVal) == kAXErrorSuccess && roleVal) {
-        CFStringGetCString((CFStringRef)roleVal, out.role, sizeof(out.role), kCFStringEncodingUTF8);
-        CFRelease(roleVal);
-    }
-
-    // Extract Position and Size
     AXValueRef posVal = NULL, sizeVal = NULL;
     CGPoint pt = CGPointZero;
     CGSize sz = CGSizeZero;
 
-    if (AXUIElementCopyAttributeValue(targetElem, kAXPositionAttribute, (CFTypeRef*)&posVal) == kAXErrorSuccess && posVal) {
+    Boolean hasPos = (AXUIElementCopyAttributeValue(elem, kAXPositionAttribute, (CFTypeRef*)&posVal) == kAXErrorSuccess && posVal);
+    if (hasPos) {
         AXValueGetValue(posVal, kAXValueTypeCGPoint, &pt);
-        out.x = pt.x; out.y = pt.y;
         CFRelease(posVal);
     }
 
-    if (AXUIElementCopyAttributeValue(targetElem, kAXSizeAttribute, (CFTypeRef*)&sizeVal) == kAXErrorSuccess && sizeVal) {
+    Boolean hasSize = (AXUIElementCopyAttributeValue(elem, kAXSizeAttribute, (CFTypeRef*)&sizeVal) == kAXErrorSuccess && sizeVal);
+    if (hasSize) {
         AXValueGetValue(sizeVal, kAXValueTypeCGSize, &sz);
-        out.w = sz.width; out.h = sz.height;
         CFRelease(sizeVal);
     }
 
-    CFRelease(targetElem);
-    CFRelease(appElem);
+    CGRect elemRect = CGRectMake(pt.x, pt.y, sz.width, sz.height);
+    Boolean intersectsTargetDisplay = CGRectIntersectsRect(targetBounds, elemRect) && (sz.width > 2 && sz.height > 2);
 
-    out.error_code = 0;
-    return out;
+    if (!intersectsTargetDisplay && depth > 0) {
+        return;
+    }
+
+    if (intersectsTargetDisplay) {
+        CFTypeRef roleVal = NULL;
+        char roleBuf[48] = {0};
+        if (AXUIElementCopyAttributeValue(elem, kAXRoleAttribute, &roleVal) == kAXErrorSuccess && roleVal) {
+            CFStringGetCString((CFStringRef)roleVal, roleBuf, sizeof(roleBuf), kCFStringEncodingUTF8);
+            CFRelease(roleVal);
+        }
+
+        CFTypeRef titleVal = NULL;
+        char labelBuf[96] = {0};
+        if (AXUIElementCopyAttributeValue(elem, kAXTitleAttribute, &titleVal) == kAXErrorSuccess && titleVal) {
+            CFStringGetCString((CFStringRef)titleVal, labelBuf, sizeof(labelBuf), kCFStringEncodingUTF8);
+            CFRelease(titleVal);
+        } else if (AXUIElementCopyAttributeValue(elem, kAXDescriptionAttribute, &titleVal) == kAXErrorSuccess && titleVal) {
+            CFStringGetCString((CFStringRef)titleVal, labelBuf, sizeof(labelBuf), kCFStringEncodingUTF8);
+            CFRelease(titleVal);
+        }
+
+        CFTypeRef valRef = NULL;
+        char valueBuf[96] = {0};
+        if (AXUIElementCopyAttributeValue(elem, kAXValueAttribute, &valRef) == kAXErrorSuccess && valRef) {
+            if (CFGetTypeID(valRef) == CFStringGetTypeID()) {
+                CFStringGetCString((CFStringRef)valRef, valueBuf, sizeof(valueBuf), kCFStringEncodingUTF8);
+            }
+            CFRelease(valRef);
+        }
+
+        Boolean isInteractive = (strcmp(roleBuf, "AXButton") == 0 ||
+                                 strcmp(roleBuf, "AXTextField") == 0 ||
+                                 strcmp(roleBuf, "AXTextArea") == 0 ||
+                                 strcmp(roleBuf, "AXSearchField") == 0 ||
+                                 strcmp(roleBuf, "AXPopUpButton") == 0 ||
+                                 strcmp(roleBuf, "AXComboBox") == 0 ||
+                                 strcmp(roleBuf, "AXCheckBox") == 0 ||
+                                 strcmp(roleBuf, "AXRadioButton") == 0 ||
+                                 strcmp(roleBuf, "AXSwitch") == 0 ||
+                                 strcmp(roleBuf, "AXSlider") == 0 ||
+                                 strcmp(roleBuf, "AXLink") == 0 ||
+                                 strcmp(roleBuf, "AXTabButton") == 0 ||
+                                 strcmp(roleBuf, "AXMenuItem") == 0 ||
+                                 strcmp(roleBuf, "AXMenuButton") == 0);
+
+        if (isInteractive || labelBuf[0] != '\0' || valueBuf[0] != '\0') {
+            CElement item = {0};
+            item.x = pt.x; item.y = pt.y; item.w = sz.width; item.h = sz.height;
+            item.click_x = pt.x + (sz.width / 2.0);
+            item.click_y = pt.y + (sz.height / 2.0);
+
+            snprintf(item.app_name, sizeof(item.app_name), "%s", appName);
+            snprintf(item.role, sizeof(item.role), "%s", roleBuf);
+            snprintf(item.label, sizeof(item.label), "%s", labelBuf);
+            snprintf(item.value, sizeof(item.value), "%s", valueBuf);
+            push_elem(&item);
+        }
+    }
+
+    CFArrayRef children = NULL;
+    if (AXUIElementCopyAttributeValue(elem, kAXChildrenAttribute, (CFTypeRef*)&children) == kAXErrorSuccess && children) {
+        CFIndex childCount = CFArrayGetCount(children);
+        for (CFIndex i = 0; i < childCount; i++) {
+            AXUIElementRef child = (AXUIElementRef)CFArrayGetValueAtIndex(children, i);
+            traverse_fast(child, targetBounds, appName, depth + 1, maxDepth);
+        }
+        CFRelease(children);
+    }
+}
+
+static int fetch_display_elements(int displayNum, int maxDepth, int *errOut) {
+    clear_buffer();
+    *errOut = 0;
+
+    // 1. TCC Permission Check
+    if (!AXIsProcessTrusted()) {
+        *errOut = -1;
+        return 0;
+    }
+
+    // 2. Resolve Display ID
+    CGDirectDisplayID displayID = resolve_display_id(displayNum, errOut);
+    if (*errOut != 0) return 0;
+
+    CGRect targetDisplayBounds = CGDisplayBounds(displayID);
+    char appName[96] = "Unknown App";
+
+    pid_t pid = get_top_app_for_display(targetDisplayBounds, appName, sizeof(appName));
+    if (pid == 0) {
+        return 0; // Valid state: Display is active but has no visible application windows
+    }
+
+    AXUIElementRef appElem = AXUIElementCreateApplication(pid);
+    if (!appElem) {
+        *errOut = -3;
+        return 0;
+    }
+
+    AXUIElementRef rootElem = NULL;
+    if (AXUIElementCopyAttributeValue(appElem, kAXFocusedWindowAttribute, (CFTypeRef*)&rootElem) != kAXErrorSuccess || !rootElem) {
+        if (AXUIElementCopyAttributeValue(appElem, kAXMainWindowAttribute, (CFTypeRef*)&rootElem) != kAXErrorSuccess || !rootElem) {
+            rootElem = appElem;
+            CFRetain(rootElem);
+        }
+    }
+
+    traverse_fast(rootElem, targetDisplayBounds, appName, 0, maxDepth);
+
+    CFRelease(rootElem);
+    CFRelease(appElem);
+    return g_buf.count;
+}
+
+static CElement get_element_at(int idx) {
+    if (idx >= 0 && idx < g_buf.count) {
+        return g_buf.items[idx];
+    }
+    CElement empty = {0};
+    return empty;
 }
 */
 import "C" 
@@ -1122,7 +1256,7 @@ func ScreenshotAllDisplaysMacos() ([]shuffle.ScreenshotWrapper, error) {
 			log.Printf("[ERROR] Focused tree problem for screen %d: %#v", display, err)
 		}
 		if elementTree != nil {
-			screen.ElementTree = *elementTree
+			screen.ElementTree = elementTree
 		}
 
 		if len(screenSizes) >= display {
@@ -1143,24 +1277,53 @@ func ScreenshotAllDisplaysMacos() ([]shuffle.ScreenshotWrapper, error) {
 	return screens, nil
 }
 
-func FetchFocusedElement() (*shuffle.UIElement, error) {
-	res := C.get_frontmost_app_ui_element()
-	if res.error_code == -1 {
-		return nil, fmt.Errorf("accessibility permission denied. Enable Terminal/IDE in System Settings > Privacy & Security > Accessibility")
+// GetDisplayElements fetches UI elements visible on a display, returning explicit Go errors on failure.
+var treeMutex sync.Mutex
+func FetchFocusedElement(displayNum int, maxDepth int) ([]shuffle.UIElement, error) {
+	treeMutex.Lock()
+	defer treeMutex.Unlock()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	var errCode C.int
+	count := int(C.fetch_display_elements(C.int(displayNum), C.int(maxDepth), &errCode))
+
+	// Map C error flags directly to Go errors
+	switch int(errCode) {
+	case -1:
+		return nil, fmt.Errorf("accessibility permission denied: enable process in System Settings > Privacy & Security > Accessibility")
+	case -2:
+		return nil, fmt.Errorf("invalid display index %d: display not found", displayNum)
+	case -3:
+		return nil, fmt.Errorf("failed to initialize accessibility element for target application process")
 	}
 
-	if res.error_code != 0 {
-		return nil, fmt.Errorf("AXError returned code: %d", int(res.error_code))
+	if count <= 0 {
+		return nil, nil // No elements visible on this display (clean non-error state)
 	}
 
-	return &shuffle.UIElement{
-		Label: C.GoString(&res.label[0]),
-		Role:  shuffle.ElementRole(C.GoString(&res.role[0])),
-		Bounds: shuffle.Rect{
-			X:      float64(res.x),
-			Y:      float64(res.y),
-			Width:  float64(res.w),
-			Height: float64(res.h),
-		},
-	}, nil
+	defer C.clear_buffer()
+	elements := make([]shuffle.UIElement, count)
+	for i := 0; i < count; i++ {
+		cElem := C.get_element_at(C.int(i))
+		elements[i] = shuffle.UIElement{
+			AppName: C.GoString(&cElem.app_name[0]),
+			Role:    C.GoString(&cElem.role[0]),
+			Label:   C.GoString(&cElem.label[0]),
+			Value:   C.GoString(&cElem.value[0]),
+			ClickPoint: shuffle.Point{
+				X: float64(cElem.click_x),
+				Y: float64(cElem.click_y),
+			},
+			Rect: shuffle.Rect{
+				X:      float64(cElem.x),
+				Y:      float64(cElem.y),
+				Width:  float64(cElem.w),
+				Height: float64(cElem.h),
+			},
+		}
+	}
+
+	return elements, nil
 }
