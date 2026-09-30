@@ -9,12 +9,10 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 )
 
 type nonDarwinWindow struct {

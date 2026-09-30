@@ -37,4 +37,7 @@ type Window interface {
 
 	// IsCreated returns true if the native window and webview have been initialized.
 	IsCreated() bool
+
+	// Prewarm instantiates and pre-renders the window and webview in background.
+	Prewarm()
 }
