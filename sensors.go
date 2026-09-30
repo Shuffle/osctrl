@@ -39,10 +39,12 @@ type MacApp struct {
 
 // Scanner manages concurrent directory scanning
 type Scanner struct {
-	results chan shuffle.ProjectInfo
-	wg      sync.WaitGroup
-	mu      sync.Mutex
-	visited map[string]bool // Track visited dirs to avoid symlink loops
+	results  chan shuffle.ProjectInfo
+	wg       sync.WaitGroup
+	mu       sync.Mutex
+	visited  map[string]bool // Track visited dirs to avoid symlink loops
+	sem      chan struct{}   // Concurrency limiter to prevent FD exhaustion and crash
+	maxDepth int
 }
 
 type AuditLogCollector struct {
@@ -222,6 +224,26 @@ func init() {
 			"$Recycle.Bin",
 			"System Volume Information",
 			"Recovery",
+		} {
+			skipDirs[d] = true
+		}
+	}
+
+	if runtime.GOOS == "darwin" {
+		for _, d := range []string{
+			"Library",
+			".Trash",
+			"Applications",
+			"Containers",
+			"Group Containers",
+			"Caches",
+			"Saved Application State",
+			"Photos Library.photoslibrary",
+			"Music",
+			"Movies",
+			"Pictures",
+			"Podcasts",
+			"Voice Memos",
 		} {
 			skipDirs[d] = true
 		}
@@ -905,8 +927,10 @@ func indexByte(s string, c byte) int {
 // NewScanner creates a new project scanner
 func NewScanner() *Scanner {
 	return &Scanner{
-		results: make(chan shuffle.ProjectInfo),
-		visited: make(map[string]bool),
+		results:  make(chan shuffle.ProjectInfo, 100),
+		visited:  make(map[string]bool),
+		sem:      make(chan struct{}, 16), // Max 16 concurrent directory scans
+		maxDepth: 7,
 	}
 }
 
@@ -1446,8 +1470,9 @@ func (s *Scanner) Scan(rootDir string) ([]shuffle.ProjectInfo, error) {
 		return nil, fmt.Errorf("invalid root directory: %w", err)
 	}
 
-	s.wg.Add(1)
-	go s.scanDir(absRoot)
+	s.mu.Lock()
+	s.results = make(chan shuffle.ProjectInfo, 100)
+	s.mu.Unlock()
 
 	var results []shuffle.ProjectInfo
 	done := make(chan struct{})
@@ -1458,6 +1483,9 @@ func (s *Scanner) Scan(rootDir string) ([]shuffle.ProjectInfo, error) {
 		close(done)
 	}()
 
+	s.wg.Add(1)
+	go s.scanDir(absRoot, 0)
+
 	s.wg.Wait()
 	close(s.results)
 	<-done
@@ -1465,8 +1493,17 @@ func (s *Scanner) Scan(rootDir string) ([]shuffle.ProjectInfo, error) {
 	return results, nil
 }
 
-func (s *Scanner) scanDir(dir string) {
+func (s *Scanner) scanDir(dir string, depth int) {
 	defer s.wg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WARN] Recovered from panic in scanDir (%s): %v", dir, r)
+		}
+	}()
+
+	if s.maxDepth > 0 && depth > s.maxDepth {
+		return
+	}
 
 	// Resolve symlinks so we never visit the same inode twice.
 	real, err := filepath.EvalSymlinks(dir)
@@ -1482,7 +1519,10 @@ func (s *Scanner) scanDir(dir string) {
 	s.visited[real] = true
 	s.mu.Unlock()
 
+	// Acquire concurrency slot to prevent file descriptor and thread exhaustion
+	s.sem <- struct{}{}
 	entries, err := os.ReadDir(dir)
+	<-s.sem
 	if err != nil {
 		return
 	}
@@ -1510,7 +1550,7 @@ func (s *Scanner) scanDir(dir string) {
 		}
 
 		s.wg.Add(1)
-		go s.scanDir(fullPath)
+		go s.scanDir(fullPath, depth+1)
 	}
 }
 
@@ -1520,6 +1560,9 @@ func shouldSkip(name string) bool {
 	}
 	// Hidden directories (dot-prefixed) on Unix; also catches .git etc. on Windows.
 	if strings.HasPrefix(name, ".") && name != "." {
+		return true
+	}
+	if strings.HasSuffix(name, ".photoslibrary") || strings.HasSuffix(name, ".app") {
 		return true
 	}
 	return false
@@ -1561,6 +1604,11 @@ func detectProjectType(dir string) string {
 }
 
 func extractPackages(dir, projectType string) []shuffle.Software {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WARN] Recovered from panic extracting packages (%s, %s): %v", dir, projectType, r)
+		}
+	}()
 	switch projectType {
 	case "golang":
 		return extractGoPackages(dir)
@@ -1595,16 +1643,53 @@ func ListCodeScannerProjects() []shuffle.ProjectInfo {
 	}
 
 	modCache := goModCacheDir()
-
 	sc := NewScanner()
-	projects, err := sc.Scan(homeDir)
-	if err != nil {
-		log.Printf("[ERROR] Problem in codescanner: %v\n", err)
+
+	// High-priority developer locations
+	cwd, _ := os.Getwd()
+	scanCandidates := []string{
+		filepath.Join(homeDir, "git"),
+		filepath.Join(homeDir, "src"),
+		filepath.Join(homeDir, "Projects"),
+		filepath.Join(homeDir, "Developer"),
+		filepath.Join(homeDir, "code"),
+		filepath.Join(homeDir, "workspace"),
+		filepath.Join(homeDir, "Documents"),
+		filepath.Join(homeDir, "Desktop"),
+	}
+	if cwd != "" && cwd != homeDir {
+		scanCandidates = append([]string{cwd}, scanCandidates...)
+	}
+
+	var existingCandidates []string
+	for _, c := range scanCandidates {
+		if fi, err := os.Stat(c); err == nil && fi.IsDir() {
+			existingCandidates = append(existingCandidates, c)
+		}
+	}
+
+	var projects []shuffle.ProjectInfo
+	if len(existingCandidates) > 0 {
+		for _, dir := range existingCandidates {
+			subProjects, err := sc.Scan(dir)
+			if err != nil {
+				log.Printf("[WARN] Problem scanning %s: %v", dir, err)
+				continue
+			}
+			projects = append(projects, subProjects...)
+		}
+	} else {
+		var err error
+		projects, err = sc.Scan(homeDir)
+		if err != nil {
+			log.Printf("[ERROR] Problem in codescanner: %v\n", err)
+		}
 	}
 
 	var out []shuffle.ProjectInfo
+	seenPath := make(map[string]bool)
 	for _, p := range projects {
-		if p.Path == "" || len(p.Packages) == 0 {
+		if p.Path == "" || seenPath[p.Path] || len(p.Packages) == 0 {
 			continue
 		}
 		// Skip the Go module download cache — these are vendored copies,
@@ -1612,6 +1697,7 @@ func ListCodeScannerProjects() []shuffle.ProjectInfo {
 		if strings.HasPrefix(p.Path, modCache) {
 			continue
 		}
+		seenPath[p.Path] = true
 		out = append(out, p)
 	}
 	return out

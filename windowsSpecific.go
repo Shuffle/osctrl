@@ -1111,3 +1111,20 @@ $results | ConvertTo-Json -Compress
 	}
 	return wrappers, nil
 }
+
+// CheckAccessibilityTrusted returns true on Windows (not governed by macOS TCC).
+func CheckAccessibilityTrusted() bool {
+	return true
+}
+
+// PromptAccessibility is a no-op on Windows.
+func PromptAccessibility() {}
+
+// CheckScreenRecordingPermission returns true on Windows.
+func CheckScreenRecordingPermission() bool {
+	return true
+}
+
+// PromptScreenRecording is a no-op on Windows.
+func PromptScreenRecording() {}
+

@@ -34,6 +34,33 @@ import (
 #include <string.h>
 #include <stdio.h>
 
+static int CheckAccessibilityTrusted() {
+    return AXIsProcessTrusted();
+}
+
+static void PromptAccessibility() {
+    const void *keys[] = { kAXTrustedCheckOptionPrompt };
+    const void *values[] = { kCFBooleanTrue };
+    CFDictionaryRef options = CFDictionaryCreate(
+        kCFAllocatorDefault,
+        keys,
+        values,
+        1,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks
+    );
+    AXIsProcessTrustedWithOptions(options);
+    if (options) CFRelease(options);
+}
+
+static int CheckScreenRecordingPermission() {
+    return CGPreflightScreenCaptureAccess();
+}
+
+static void PromptScreenRecording() {
+    CGRequestScreenCaptureAccess();
+}
+
 static int GetNativeCursorPosition(double *x, double *y) {
     CGEventRef event = CGEventCreate(NULL);
     if (event == NULL) {
@@ -366,6 +393,25 @@ static CElement get_element_at(int idx) {
 */
 import "C" 
 
+// CheckAccessibilityTrusted returns true if the process is trusted for macOS Accessibility.
+func CheckAccessibilityTrusted() bool {
+	return C.CheckAccessibilityTrusted() != 0
+}
+
+// PromptAccessibility prompts the user with macOS System Settings Accessibility dialog.
+func PromptAccessibility() {
+	C.PromptAccessibility()
+}
+
+// CheckScreenRecordingPermission returns true if screen capture access is granted.
+func CheckScreenRecordingPermission() bool {
+	return C.CheckScreenRecordingPermission() != 0
+}
+
+// PromptScreenRecording requests screen capture access from macOS.
+func PromptScreenRecording() {
+	C.PromptScreenRecording()
+}
 
 func typeText(text string) {
 	utf16Runes := utf16.Encode([]rune(text))

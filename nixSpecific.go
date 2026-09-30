@@ -1029,7 +1029,12 @@ func displaySizeWlrRandr() ([]wlrDisplay, error) {
 				displays = append(displays, current)
 				id++
 			}
-			current = wlrDisplay{OutputName: strings.Fields(line)[0]}
+			fields := strings.Fields(line)
+			if len(fields) > 0 {
+				current = wlrDisplay{OutputName: fields[0]}
+			} else {
+				current = wlrDisplay{}
+			}
 			continue
 		}
 		// Resolution line (indented, contains "current").
@@ -1148,3 +1153,20 @@ func runTool(outPath, name string, args ...string) error {
 func tempPathLinux() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("edr-%d.png", time.Now().UnixNano()))
 }
+
+// CheckAccessibilityTrusted returns true on Linux.
+func CheckAccessibilityTrusted() bool {
+	return true
+}
+
+// PromptAccessibility is a no-op on Linux.
+func PromptAccessibility() {}
+
+// CheckScreenRecordingPermission returns true on Linux.
+func CheckScreenRecordingPermission() bool {
+	return true
+}
+
+// PromptScreenRecording is a no-op on Linux.
+func PromptScreenRecording() {}
+
