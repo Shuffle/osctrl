@@ -312,6 +312,19 @@ func (w *nonDarwinWindow) IsCreated() bool {
 	return w.isCreated
 }
 
+func (w *nonDarwinWindow) Prewarm() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.isCreated {
+		if err := w.startLocalServer(); err != nil {
+			log.Printf("[ERROR] Failed to prewarm local webview server: %v", err)
+			return
+		}
+		w.isCreated = true
+	}
+}
+
 // ChooseFolder presents a directory chooser dialog on Windows and Linux.
 func ChooseFolder(title, prompt string) (string, error) {
 	if runtime.GOOS == "windows" {

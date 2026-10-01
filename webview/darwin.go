@@ -51,10 +51,17 @@ func HandleBridgeAction(cAction *C.char, cPayload *C.char) (cRes *C.char) {
 	activeWindowMu.RUnlock()
 
 	if win == nil || win.cfg.BridgeHandler == nil {
+		log.Printf("[WARNING] HandleBridgeAction: bridge handler not initialized for action: %s", action)
 		return C.CString(`{"error": "bridge handler not initialized"}`)
 	}
 
+	if action == "runPrompt" {
+		log.Printf("[INFO] [Bridge -> Backend] action=%s (payload bytes: %d)", action, len(payload))
+	}
 	resp := win.cfg.BridgeHandler(action, payload)
+	if action == "runPrompt" {
+		log.Printf("[INFO] [Backend -> Bridge] action=%s completed (response bytes: %d)", action, len(resp))
+	}
 	return C.CString(resp)
 }
 
