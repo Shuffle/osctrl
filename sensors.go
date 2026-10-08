@@ -930,7 +930,7 @@ func NewScanner() *Scanner {
 		results:  make(chan shuffle.ProjectInfo, 100),
 		visited:  make(map[string]bool),
 		sem:      make(chan struct{}, 16), // Max 16 concurrent directory scans
-		maxDepth: 7,
+		maxDepth: 4,
 	}
 }
 
